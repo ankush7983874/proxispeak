@@ -7,12 +7,15 @@
 ## Features
 
 - 🗺 **2D Virtual Office** — Canvas-rendered office with Focus Zone, Collaboration, Meeting Space, and Common Area
-- 👥 **Real-Time Presence** — Live avatars powered by Socket.IO; join/leave events are instant
-- 🏃 **Avatar Movement** — WASD / arrow keys and on-screen buttons; server-authoritative position clamping
-- 📍 **Geospatial Proximity Engine** — MongoDB with `2dsphere` index; `$geoWithin` queries detect nearby users
-- 🔊 **Spatial Voice Chat** — WebRTC peer connections with Web Audio API `GainNode` for smooth distance-based volume
-- 🎤 **Microphone Controls** — Request, mute, unmute; visible permission status
-- 📱 **Responsive UI** — Works on desktop, tablet, and mobile
+- 🏢 **Multiple Office Rooms** — Public General Office, dedicated Meeting Room, and quiet Focus Room with live participant badges
+- 🔒 **Private Meeting Rooms** — Collision-free `PRV-XXXX` invitation codes, host transfer, 1-click code copying, and auto-cleanup
+- 🎨 **Avatar Customization** — Custom display names, 10-color palette, badge styles (Star, Crown, Diamond), and Online/Away status with `localStorage` caching
+- 👥 **Real-Time Presence** — Live avatars powered by Socket.IO; room-scoped join/leave events and movements
+- 🏃 **Avatar Movement** — WASD / arrow keys and on-screen direction pad; server-authoritative position clamping
+- 📍 **Geospatial Proximity Engine** — MongoDB with `2dsphere` index; earshot radius filtering strictly within the same room
+- 🔊 **Spatial Voice Chat** — WebRTC peer connections with Web Audio API `GainNode` for smooth distance-based volume; automatic audio teardown on room switch
+- 🎤 **Microphone Controls** — Request, mute/unmute, and hardware-releasing turn-off controls with permission status
+- 📱 **Responsive UI** — Accessible desktop, tablet, and mobile layouts
 
 ---
 
@@ -203,13 +206,47 @@ Open http://localhost:5173 in your browser.
 
 ---
 
-## Testing with Two Users
+## Testing with Two Users (Phase 3 Multi-Room & Avatars)
 
-1. Start both servers (see above)
-2. Open **http://localhost:5173** in Browser Window 1
-3. Open **http://localhost:5173** in Browser Window 2 (or a private/incognito window)
-4. Both should show a green **Connected** dot
-5. Move one avatar — the other window should update in real time
+1. **Start both backend and frontend:**
+   ```powershell
+   # Terminal 1: Backend
+   cd D:\proxispeak\backend
+   npm run dev
+
+   # Terminal 2: Frontend
+   cd D:\proxispeak\frontend
+   npm run dev
+   ```
+
+2. **Public Room Switching & Isolation:**
+   - Open **http://localhost:5173** in Browser Window 1.
+   - Open **http://localhost:5173** in Browser Window 2 (incognito or second browser profile).
+   - Both start in **General Office**. Avatars and participants appear in both windows.
+   - In Window 2, click **Meeting Room**. Window 2 disappears from Window 1's canvas and participant list. Window 1's room badge updates to `General: 1, Meeting: 1`.
+   - Move avatar in Window 2 — Window 1 receives no movement events (room-isolated).
+
+3. **Avatar Customization & Real-Time Sync:**
+   - In Window 1, click **Customize Avatar**.
+   - Set name to `"Alice"`, choose purple color (`#9664d9`), select Crown style (`👑`), and set status to **Away**.
+   - Click **Save Changes**.
+   - In Window 2, switch to **General Office** — Alice immediately appears in purple with a crown badge and an amber away indicator.
+   - Refresh Window 1 — Alice's preferences are restored from `localStorage`.
+
+4. **Private Meeting Rooms & Invitation Codes:**
+   - In Window 1, click **New Meeting**, enter title `"Design Review"`, and click **Create & Enter**.
+   - Window 1 enters the private room. Notice the invitation code chip `PRV-XXXX`. Click **Copy** (`Copied!` toast).
+   - In Window 2, click **Join by Code**, enter `"PRV-INVALID"`. Notice the server error: `"Invalid or expired meeting invitation code."`.
+   - In Window 2, enter the actual code from Window 1 and click **Join Meeting**. Both users now see each other in the private executive suite.
+
+5. **Room-Scoped Proximity Audio Isolation:**
+   - In Window 1 and Window 2 (both in the private room), click **Enable Microphone**.
+   - Move avatars close together (within 100px earshot ring). Speak — audio is audible with distance attenuation.
+   - In Window 2, click **Leave Meeting** (returns to General Office). Audio terminates immediately and peer count drops.
+   - Speak in Window 1 — no audio leaks to Window 2 in General Office.
+
+6. **Automatic Private Room Cleanup:**
+   - In Window 1, click **Leave Meeting**. Both users have now left the private room; the room code is automatically pruned from server memory.
 
 ---
 
@@ -218,9 +255,10 @@ Open http://localhost:5173 in your browser.
 1. Open two browser windows as above
 2. In Window 1, click **Enable Microphone** and grant permission
 3. In Window 2, click **Enable Microphone** and grant permission
-4. Move both avatars close together (within the dashed earshot ring)
+4. Move both avatars close together in the **same room** (within the dashed earshot ring)
 5. Speak into your mic — you should hear audio in the other window
 6. Move avatars apart — volume decreases; past 100px → silence
+7. Switch one user to another room — audio is cut off immediately via WebRTC peer teardown
 
 > **Troubleshooting voice chat:**
 > - Ensure microphone permission is granted in browser settings
@@ -237,6 +275,7 @@ Open http://localhost:5173 in your browser.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/health` | Server status, user count, DB status |
+| `GET` | `/api/ice-servers` | Dynamic ICE server configuration (STUN/TURN) |
 | `GET` | `/api/users/nearby?x=400&y=250` | Users within earshot of canvas position |
 
 ### Socket.IO Events
@@ -245,27 +284,47 @@ Open http://localhost:5173 in your browser.
 
 | Event | Payload | Description |
 |-------|---------|-------------|
-| `move` | `{ x: number, y: number }` | Request avatar position update |
-| `webrtc-offer` | `{ target: string, offer: RTCSessionDescription }` | Send WebRTC offer to target peer |
-| `webrtc-answer` | `{ target: string, answer: RTCSessionDescription }` | Send WebRTC answer to offerer |
-| `webrtc-ice-candidate` | `{ target: string, candidate: RTCIceCandidate }` | Forward ICE candidate |
+| `move` | `{ x: number, y: number }` | Request avatar position update (room-scoped) |
+| `update-mic-status` | `{ micEnabled: boolean }` | Update user microphone broadcast status |
+| `join-room` | `{ room: string, code?: string, profile?: object }` | Switch to public or private meeting room |
+| `create-private-room` | `{ title: string }` | Create a private meeting with random invitation code |
+| `leave-private-room` | `void` | Return to General Office |
+| `update-profile` | `{ name?, avatarColor?, avatarStyle?, status? }` | Update avatar appearance and status |
+| `webrtc-offer` | `{ target: string, offer: RTCSessionDescription }` | Send WebRTC offer to target peer (same room verified) |
+| `webrtc-answer` | `{ target: string, answer: RTCSessionDescription }` | Send WebRTC answer to offerer (same room verified) |
+| `webrtc-ice-candidate` | `{ target: string, candidate: RTCIceCandidate }` | Forward ICE candidate (same room verified) |
 
 #### Server → Client
 
 | Event | Payload | Description |
 |-------|---------|-------------|
-| `initial-users` | `User[]` | All current users on connect |
-| `user-joined` | `User` | New user joined |
-| `user-moved` | `User` | User position updated |
-| `user-left` | `string` (socket ID) | User disconnected |
-| `proximity-update` | `string[]` (socket IDs) | IDs of users within earshot |
+| `initial-users` | `User[]` | All users in the joined room |
+| `user-joined` | `User` | New user joined current room |
+| `user-moved` | `User` | User position updated in current room |
+| `user-left` | `string` (socket ID) | User left current room / disconnected |
+| `user-profile-updated` | `User` | Peer customized avatar in current room |
+| `user-mic-status` | `{ id: string, micEnabled: boolean }` | Peer microphone status changed |
+| `proximity-update` | `string[]` (socket IDs) | IDs of users within earshot in same room |
+| `room-info` | `{ room, title, isPrivate, code?, hostSocketId? }` | Active room metadata |
+| `room-counts` | `{ [roomName]: number }` | Real-time participant counts per room |
+| `room-error` | `{ message: string }` | Room join failure or rejection notice |
 | `webrtc-offer` | `{ from: string, offer }` | Incoming WebRTC offer |
 | `webrtc-answer` | `{ from: string, answer }` | Incoming WebRTC answer |
 | `webrtc-ice-candidate` | `{ from: string, candidate }` | Incoming ICE candidate |
 
 **User object:**
 ```json
-{ "id": "abc123", "name": "Guest-ABC1", "x": 400, "y": 250 }
+{
+  "id": "abc123",
+  "name": "Alice",
+  "x": 400,
+  "y": 250,
+  "micEnabled": true,
+  "room": "general",
+  "avatarColor": "#9664d9",
+  "avatarStyle": "crown",
+  "status": "online"
+}
 ```
 
 ---
@@ -333,13 +392,44 @@ Branch naming convention: `feature/`, `fix/`, `docs/`, `test/`
 
 ## Environment Variables
 
+### Backend (`backend/.env`)
+
 | Variable | Default | Description |
 |---------|---------|-------------|
 | `PORT` | `5000` | Backend listen port |
 | `FRONTEND_URL` | `http://localhost:5173` | Allowed CORS origin |
-| `MONGODB_URI` | *(empty)* | MongoDB connection string |
-| `STUN_URLS` | Google STUN | Comma-separated STUN URLs |
+| `MONGODB_URI` | *(empty)* | MongoDB connection string (falls back to in-memory) |
+| `STUN_URLS` | Google STUN | Comma-separated STUN server URLs |
+| `TURN_URL` | *(empty)* | Optional TURN server URL (e.g. `turn:turn.example.com:3478`) |
+| `TURN_USERNAME` | *(empty)* | Optional TURN username |
+| `TURN_CREDENTIAL` | *(empty)* | Optional TURN credential |
 | `MOVE_RATE_LIMIT` | `20` | Max move events per second per user |
+
+### Frontend (`frontend/.env`)
+
+| Variable | Default | Description |
+|---------|---------|-------------|
+| `VITE_SOCKET_URL` | `http://localhost:5000` | Socket.IO server address |
+| `VITE_STUN_URLS` | Google STUN | Client-side STUN URLs fallback |
+| `VITE_TURN_URL` | *(empty)* | Client-side TURN server URL |
+| `VITE_TURN_USERNAME` | *(empty)* | Client-side TURN username |
+| `VITE_TURN_CREDENTIAL`| *(empty)* | Client-side TURN credential |
+
+---
+
+## Automated Verification & Testing
+
+Run unit tests for proximity calculations, distance formulas, volume curves, and coordinate normalization:
+
+```powershell
+npm --prefix backend test
+```
+
+Build the frontend bundle:
+
+```powershell
+npm --prefix frontend run build
+```
 
 ---
 

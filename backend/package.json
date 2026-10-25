@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "nodemon server.js",
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node ../tests/proximity.test.mjs && node ../tests/rooms.test.mjs"
   },
   "dependencies": {
     "cors": "^2.8.5",

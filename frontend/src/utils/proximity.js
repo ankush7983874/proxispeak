@@ -39,6 +39,7 @@ export function distance(a, b) {
  */
 export function getNearbyUsers(me, others, radius = EARSHOT_RADIUS) {
   return others
+    .filter((user) => !user.room || !me.room || user.room === me.room)
     .map((user) => ({ user, dist: distance(me, user) }))
     .filter(({ dist }) => dist <= radius)
     .sort((a, b) => a.dist - b.dist);

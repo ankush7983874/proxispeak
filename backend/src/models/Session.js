@@ -46,6 +46,11 @@ const sessionSchema = new mongoose.Schema(
     // Raw canvas coordinates for quick in-memory use
     x: { type: Number, required: true, min: 0, max: CANVAS_WIDTH  },
     y: { type: Number, required: true, min: 0, max: CANVAS_HEIGHT },
+    micEnabled: { type: Boolean, default: false },
+    room: { type: String, default: 'general', index: true },
+    avatarColor: { type: String, default: '#259765' },
+    avatarStyle: { type: String, default: 'classic' },
+    status: { type: String, default: 'online' },
     // GeoJSON Point with normalised coordinates for geospatial queries
     location: {
       type: {

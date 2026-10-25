@@ -20,60 +20,141 @@ import { useEffect, useRef, useCallback, useState } from 'react';
 import { volumeFromDistance } from '../utils/proximity.js';
 import socket from '../services/socket.js';
 
-// STUN configuration — loaded from Vite env or falling back to public STUN
+// STUN / TURN configuration — loaded from Vite env or fallback to public STUN
 const STUN_URLS = (import.meta.env.VITE_STUN_URLS || 'stun:stun.l.google.com:19302')
   .split(',')
   .map((u) => u.trim());
 
-const ICE_SERVERS = [{ urls: STUN_URLS }];
+const DEFAULT_ICE_SERVERS = [{ urls: STUN_URLS }];
+
+// Optional TURN configuration via client-side environment
+if (import.meta.env.VITE_TURN_URL) {
+  DEFAULT_ICE_SERVERS.push({
+    urls: import.meta.env.VITE_TURN_URL,
+    username: import.meta.env.VITE_TURN_USERNAME || '',
+    credential: import.meta.env.VITE_TURN_CREDENTIAL || '',
+  });
+}
 
 export function useWebRTC(myId) {
   const [micState, setMicState] = useState('idle'); // idle | requesting | active | muted | denied | error
   const [audioConnections, setAudioConnections] = useState(0);
+  const [webrtcError, setWebrtcError] = useState(null);
 
   const localStreamRef    = useRef(null);   // MediaStream from getUserMedia
   const audioContextRef   = useRef(null);   // AudioContext (created on first mic grant)
-  const peersRef          = useRef({});     // { [remoteId]: { pc, gainNode, audioEl } }
+  const peersRef          = useRef({});     // { [remoteId]: { pc, gainNode, audioEl, retryCount } }
   const pendingCandidates = useRef({});     // ICE candidates buffered before remote desc is set
+  const iceServersRef     = useRef(DEFAULT_ICE_SERVERS);
+  const nearbyUsersRef    = useRef([]);
+
+  // Fetch server ICE configuration dynamically if available
+  useEffect(() => {
+    fetch('/api/ice-servers')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data?.iceServers && Array.isArray(data.iceServers)) {
+          iceServersRef.current = data.iceServers;
+        }
+      })
+      .catch(() => {
+        // Fall back gracefully to DEFAULT_ICE_SERVERS
+      });
+  }, []);
 
   // ── Mic control ────────────────────────────────────────────────────────────
 
   const requestMic = useCallback(async () => {
     if (localStreamRef.current) return; // already granted
     setMicState('requesting');
+    setWebrtcError(null);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      });
       localStreamRef.current = stream;
 
-      // Create audio context for gain control
+      // Handle microphone device unplugged / tracks stopped externally
+      stream.getAudioTracks().forEach((track) => {
+        track.onended = () => {
+          disableMic();
+        };
+      });
+
+      // Create or resume audio context for gain control
       const AudioContext = window.AudioContext || window.webkitAudioContext;
-      audioContextRef.current = new AudioContext();
+      if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+        audioContextRef.current = new AudioContext();
+      }
+      if (audioContextRef.current.state === 'suspended') {
+        await audioContextRef.current.resume();
+      }
 
       setMicState('active');
+      socket.emit('update-mic-status', { micEnabled: true });
+
+      // If we already have nearby users, add track and initiate connections
+      if (myId && nearbyUsersRef.current.length > 0) {
+        nearbyUsersRef.current.forEach(({ user }) => {
+          if (user.id === myId) return;
+          const isOfferer = myId < user.id;
+          if (isOfferer) {
+            initiateOffer(user.id);
+          }
+        });
+      }
     } catch (err) {
       if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
         setMicState('denied');
+        setWebrtcError('Microphone permission denied. Please allow microphone access in your browser settings.');
+      } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+        setMicState('error');
+        setWebrtcError('No microphone hardware detected.');
       } else {
         setMicState('error');
+        setWebrtcError(err.message || 'Unable to access microphone.');
       }
       console.warn('[WebRTC] Mic error:', err.message);
     }
-  }, []);
+  }, [myId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const disableMic = useCallback(() => {
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((t) => t.stop());
+      localStreamRef.current = null;
+    }
+    setMicState('idle');
+    setWebrtcError(null);
+    socket.emit('update-mic-status', { micEnabled: false });
+
+    // Close all current peer connections since we no longer transmit audio
+    Object.keys(peersRef.current).forEach((rid) => {
+      closePeer(rid);
+    });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggleMute = useCallback(() => {
     const stream = localStreamRef.current;
     if (!stream) return;
-    const enabled = !stream.getAudioTracks()[0]?.enabled;
+    const audioTrack = stream.getAudioTracks()[0];
+    if (!audioTrack) return;
+    const enabled = !audioTrack.enabled;
     stream.getAudioTracks().forEach((t) => { t.enabled = enabled; });
     setMicState(enabled ? 'active' : 'muted');
+    socket.emit('update-mic-status', { micEnabled: enabled });
   }, []);
 
   // ── Peer connection helpers ────────────────────────────────────────────────
 
   const createPeer = useCallback((remoteId) => {
-    if (peersRef.current[remoteId]) return peersRef.current[remoteId].pc;
+    if (peersRef.current[remoteId]?.pc) return peersRef.current[remoteId].pc;
 
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    const pc = new RTCPeerConnection({ iceServers: iceServersRef.current });
 
     // Add local audio tracks if available
     if (localStreamRef.current) {
@@ -97,16 +178,20 @@ export function useWebRTC(myId) {
       const audioCtx = audioContextRef.current;
       if (!audioCtx) return;
 
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume().catch(() => {});
+      }
+
       const source   = audioCtx.createMediaStreamSource(remoteStream);
       const gainNode = audioCtx.createGain();
-      gainNode.gain.value = 0; // start silent; updated by updateVolume()
+      gainNode.gain.value = 0; // start silent; updated by updateVolumes()
       source.connect(gainNode);
       gainNode.connect(audioCtx.destination);
 
-      // Also attach to an audio element as fallback for browsers that need it
+      // Also attach to an audio element as fallback for autoplay compliance
       const audioEl  = new Audio();
       audioEl.srcObject = remoteStream;
-      audioEl.muted  = true; // muted because we route through Web Audio API
+      audioEl.muted  = true; // muted because audio is routed through Web Audio GainNode
       audioEl.play().catch(() => {});
 
       peersRef.current[remoteId] = {
@@ -123,11 +208,21 @@ export function useWebRTC(myId) {
         pc.iceConnectionState === 'closed' ||
         pc.iceConnectionState === 'disconnected'
       ) {
+        const peer = peersRef.current[remoteId];
+        // Retry once if disconnected and peer is still nearby
+        if (pc.iceConnectionState === 'failed' && peer && (!peer.retryCount || peer.retryCount < 1)) {
+          console.warn(`[WebRTC] ICE failed with ${remoteId}. Attempting restart...`);
+          peer.retryCount = (peer.retryCount || 0) + 1;
+          if (typeof pc.restartIce === 'function') {
+            pc.restartIce();
+            return;
+          }
+        }
         closePeer(remoteId);
       }
     };
 
-    peersRef.current[remoteId] = { pc, gainNode: null, audioEl: null };
+    peersRef.current[remoteId] = { pc, gainNode: null, audioEl: null, retryCount: 0 };
     return pc;
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -135,13 +230,33 @@ export function useWebRTC(myId) {
   const closePeer = useCallback((remoteId) => {
     const peer = peersRef.current[remoteId];
     if (!peer) return;
-    peer.pc.close();
-    if (peer.gainNode) peer.gainNode.disconnect();
-    if (peer.audioEl)  peer.audioEl.pause();
+    try {
+      peer.pc.close();
+    } catch {
+      // ignore already closed
+    }
+    if (peer.gainNode) {
+      try {
+        peer.gainNode.disconnect();
+      } catch {
+        // ignore already disconnected
+      }
+    }
+    if (peer.audioEl) {
+      peer.audioEl.pause();
+      peer.audioEl.srcObject = null;
+    }
     delete peersRef.current[remoteId];
     delete pendingCandidates.current[remoteId];
     setAudioConnections((n) => Math.max(0, n - 1));
   }, []);
+
+  const cleanAllPeers = useCallback(() => {
+    Object.keys(peersRef.current).forEach((rid) => {
+      closePeer(rid);
+    });
+    setAudioConnections(0);
+  }, [closePeer]);
 
   // ── Volume attenuation ─────────────────────────────────────────────────────
 
@@ -149,7 +264,8 @@ export function useWebRTC(myId) {
    * Called by App.jsx whenever positions change.
    * nearbyUsers: Array<{ user: object, dist: number }>
    */
-  const updateVolumes = useCallback((nearbyUsers, allUsers) => {
+  const updateVolumes = useCallback((nearbyUsers) => {
+    nearbyUsersRef.current = nearbyUsers;
     const nearbyIds = new Set(nearbyUsers.map((n) => n.user.id));
 
     // Close connections for users who moved out of earshot
@@ -160,7 +276,7 @@ export function useWebRTC(myId) {
     // Set gain for users in earshot
     nearbyUsers.forEach(({ user, dist }) => {
       const peer = peersRef.current[user.id];
-      if (peer?.gainNode) {
+      if (peer?.gainNode && audioContextRef.current) {
         const gain = volumeFromDistance(dist);
         peer.gainNode.gain.setTargetAtTime(gain, audioContextRef.current.currentTime, 0.1);
       }
@@ -273,8 +389,11 @@ export function useWebRTC(myId) {
   return {
     micState,
     audioConnections,
+    webrtcError,
     requestMic,
+    disableMic,
     toggleMute,
     updateVolumes,
+    cleanAllPeers,
   };
 }

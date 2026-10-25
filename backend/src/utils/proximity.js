@@ -41,6 +41,8 @@ export function getNearbyUsers(me, usersMap) {
   const results = [];
   for (const [, user] of usersMap) {
     if (user.id === me.id) continue;
+    // Room isolation: users in different rooms cannot hear each other
+    if (user.room && me.room && user.room !== me.room) continue;
     const dist = canvasDistance(me, user);
     if (dist <= EARSHOT_PIXELS) {
       results.push({ user, dist });
