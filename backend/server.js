@@ -95,9 +95,20 @@ const PUBLIC_ROOMS = ['general', 'meeting', 'focus'];
 // Private rooms: Map of code -> { code, title, hostSocketId, createdAt }
 const privateRooms = new Map();
 
+// Active workstation occupancy: Map of deskId -> { socketId, userId, name, deskName }
+const occupiedWorkstations = new Map();
+
 // Avatar style & status allowed lists
 const VALID_STYLES   = new Set(['classic', 'star', 'diamond', 'crown']);
 const VALID_STATUSES = new Set(['online', 'away', 'busy']);
+
+// Email sanitization regex
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+function sanitizeEmail(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim().toLowerCase();
+  return EMAIL_REGEX.test(trimmed) ? trimmed : null;
+}
 
 // ── Utility: structured log ──────────────────────────────────────────────────
 function log(level, message) {
@@ -236,6 +247,9 @@ io.on('connection', async (socket) => {
   const user = {
     id: socket.id,
     name,
+    email: null,
+    guestId: null,
+    workstation: null,
     x: startX,
     y: startY,
     micEnabled: false,
@@ -248,6 +262,9 @@ io.on('connection', async (socket) => {
 
   // Join default public room
   socket.join('general');
+
+  // Emit current workstation occupancy state
+  socket.emit('workstation-occupancy', Object.fromEntries(occupiedWorkstations));
 
   // Persist to MongoDB (non-blocking; log error but don't crash)
   const db = getDBStatus();
@@ -322,7 +339,8 @@ io.on('connection', async (socket) => {
 
   // ── Room Navigation ──────────────────────────────────────────────────────
 
-  socket.on('join-room', ({ room: targetRoom, code, profile }) => {
+  socket.on('join-room', (data, callback) => {
+    const { room: targetRoom, code, profile } = (data && typeof data === 'object') ? data : {};
     let roomToJoin = (targetRoom || 'general').trim();
     let roomTitle = 'General Office';
     let isPrivate = false;
@@ -337,6 +355,9 @@ io.on('connection', async (socket) => {
       const lookupCode = (code || roomToJoin).trim().toUpperCase();
       if (!privateRooms.has(lookupCode)) {
         socket.emit('room-error', { message: 'Invalid or expired meeting invitation code.' });
+        if (typeof callback === 'function') {
+          callback({ success: false, error: 'Invalid or expired meeting invitation code.' });
+        }
         return;
       }
       const priv = privateRooms.get(lookupCode);
@@ -346,35 +367,84 @@ io.on('connection', async (socket) => {
       hostSocketId = priv.hostSocketId;
     }
 
-    const oldRoom = user.room || 'general';
-    if (oldRoom === roomToJoin) return; // already in this room
+    const oldRoom = user.room;
+
+    // Optional profile update on join
+    let profileUpdated = false;
+    if (profile && typeof profile === 'object') {
+      if (profile.name) {
+        const clean = sanitizeDisplayName(profile.name);
+        if (clean && clean !== user.name) {
+          user.name = clean;
+          profileUpdated = true;
+        }
+      }
+      if (profile.email) {
+        const cleanEmail = sanitizeEmail(profile.email);
+        if (cleanEmail && cleanEmail !== user.email) {
+          user.email = cleanEmail;
+          profileUpdated = true;
+        }
+      }
+      if (profile.guestId && typeof profile.guestId === 'string') {
+        user.guestId = profile.guestId.slice(0, 50);
+      }
+      if (profile.avatarColor && /^#[0-9a-fA-F]{6}$/.test(profile.avatarColor)) {
+        user.avatarColor = profile.avatarColor;
+        profileUpdated = true;
+      }
+      if (profile.avatarStyle && VALID_STYLES.has(profile.avatarStyle)) {
+        user.avatarStyle = profile.avatarStyle;
+        profileUpdated = true;
+      }
+      if (profile.status && VALID_STATUSES.has(profile.status)) {
+        user.status = profile.status;
+        profileUpdated = true;
+      }
+    }
+
+    if (oldRoom === roomToJoin) {
+      if (profileUpdated) {
+        io.to(roomToJoin).emit('user-profile-updated', {
+          id: socket.id,
+          name: user.name,
+          avatarColor: user.avatarColor,
+          avatarStyle: user.avatarStyle,
+          status: user.status,
+        });
+      }
+      const currentRoomUsers = Array.from(users.values()).filter((u) => u.room === roomToJoin);
+      socket.emit('initial-users', currentRoomUsers);
+      socket.emit('room-info', {
+        room: roomToJoin,
+        title: roomTitle,
+        isPrivate,
+        code: isPrivate ? roomToJoin : null,
+        hostSocketId,
+      });
+      if (typeof callback === 'function') {
+        callback({
+          success: true,
+          room: roomToJoin,
+          title: roomTitle,
+          isPrivate,
+          code: isPrivate ? roomToJoin : null,
+        });
+      }
+      return;
+    }
 
     // Leave previous room & notify peers in that room
-    socket.leave(oldRoom);
-    socket.to(oldRoom).emit('user-left', socket.id);
-    cleanupPrivateRoomIfEmpty(oldRoom);
+    if (oldRoom) {
+      socket.leave(oldRoom);
+      socket.to(oldRoom).emit('user-left', socket.id);
+      cleanupPrivateRoomIfEmpty(oldRoom);
+    }
 
     // Update user record
     user.room = roomToJoin;
     user.x = 270 + Math.floor(Math.random() * 180);
     user.y = 60  + Math.floor(Math.random() * 60);
-
-    // Optional profile update on join
-    if (profile && typeof profile === 'object') {
-      if (profile.name) {
-        const clean = sanitizeDisplayName(profile.name);
-        if (clean) user.name = clean;
-      }
-      if (profile.avatarColor && /^#[0-9a-fA-F]{6}$/.test(profile.avatarColor)) {
-        user.avatarColor = profile.avatarColor;
-      }
-      if (profile.avatarStyle && VALID_STYLES.has(profile.avatarStyle)) {
-        user.avatarStyle = profile.avatarStyle;
-      }
-      if (profile.status && VALID_STATUSES.has(profile.status)) {
-        user.status = profile.status;
-      }
-    }
 
     socket.join(roomToJoin);
 
@@ -388,6 +458,16 @@ io.on('connection', async (socket) => {
       code: isPrivate ? roomToJoin : null,
       hostSocketId,
     });
+
+    if (typeof callback === 'function') {
+      callback({
+        success: true,
+        room: roomToJoin,
+        title: roomTitle,
+        isPrivate,
+        code: isPrivate ? roomToJoin : null,
+      });
+    }
 
     // Notify other users in the new room
     socket.to(roomToJoin).emit('user-joined', user);
@@ -489,6 +569,80 @@ io.on('connection', async (socket) => {
     io.emit('room-counts', getRoomCounts());
 
     log('log', `[ROOM-LEAVE] ${user.name} left ${oldRoom} returned to general`);
+  });
+
+  socket.on('leave-office', () => {
+    const oldRoom = user.room;
+    if (oldRoom) {
+      socket.leave(oldRoom);
+      socket.to(oldRoom).emit('user-left', socket.id);
+      cleanupPrivateRoomIfEmpty(oldRoom);
+    }
+
+    if (user.workstation) {
+      occupiedWorkstations.delete(user.workstation);
+      user.workstation = null;
+      io.emit('workstation-occupancy', Object.fromEntries(occupiedWorkstations));
+    }
+
+    user.room = null;
+    io.emit('room-counts', getRoomCounts());
+    log('log', `[LEAVE-OFFICE] ${user.name} (${socket.id}) exited to welcome screen`);
+
+    if (db.connected) {
+      Session.updateOne(
+        { socketId: socket.id },
+        {
+          $set: {
+            room: null,
+            lastSeen: new Date(),
+          },
+        }
+      ).catch((err) => log('warn', `[DB] Session leave office update failed: ${err.message}`));
+    }
+  });
+
+  // ── In-Room Real-Time Text Chat ──────────────────────────────────────────
+  socket.on('send-room-chat', ({ text }) => {
+    if (!text || typeof text !== 'string') return;
+    const clean = text.replace(/<[^>]*>?/gm, '').trim().slice(0, 300);
+    if (!clean) return;
+
+    const chatMsg = {
+      id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      senderId: socket.id,
+      senderName: user.name,
+      avatarColor: user.avatarColor,
+      text: clean,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      room: user.room || 'general',
+    };
+
+    io.to(user.room || 'general').emit('room-chat-message', chatMsg);
+    log('log', `[CHAT] [${user.room}] ${user.name}: ${clean.slice(0, 40)}`);
+  });
+
+  // ── Workstation Occupancy ────────────────────────────────────────────────
+  socket.on('sit-workstation', ({ deskId, deskName }) => {
+    if (!deskId || typeof deskId !== 'string') return;
+    user.workstation = deskId;
+    occupiedWorkstations.set(deskId, {
+      socketId: socket.id,
+      userId: user.id,
+      name: user.name,
+      deskName: deskName || deskId,
+    });
+    io.emit('workstation-occupancy', Object.fromEntries(occupiedWorkstations));
+    log('log', `[WORKSTATION] ${user.name} occupied ${deskId}`);
+  });
+
+  socket.on('leave-workstation', () => {
+    if (user.workstation) {
+      occupiedWorkstations.delete(user.workstation);
+      user.workstation = null;
+      io.emit('workstation-occupancy', Object.fromEntries(occupiedWorkstations));
+      log('log', `[WORKSTATION] ${user.name} left workstation`);
+    }
   });
 
   // ── Avatar & Profile Customization ───────────────────────────────────────
@@ -596,6 +750,11 @@ io.on('connection', async (socket) => {
     const currentRoom = user.room;
     users.delete(socket.id);
 
+    if (user.workstation) {
+      occupiedWorkstations.delete(user.workstation);
+      io.emit('workstation-occupancy', Object.fromEntries(occupiedWorkstations));
+    }
+
     // Notify only users in the room where user was present
     if (currentRoom) {
       socket.to(currentRoom).emit('user-left', socket.id);
@@ -612,7 +771,6 @@ io.on('connection', async (socket) => {
 
     log('log', `[DISCONNECT] ${user.name} (${reason}) — ${users.size} remaining`);
   });
-});
 });
 
 // ── Startup ──────────────────────────────────────────────────────────────────

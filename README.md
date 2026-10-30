@@ -6,16 +6,21 @@
 
 ## Features
 
-- 🗺 **2D Virtual Office** — Canvas-rendered office with Focus Zone, Collaboration, Meeting Space, and Common Area
+- 🚪 **Reference 1 Guest Login** — Premium royal blue welcome screen with large white rounded container; simplified guest identification requiring **only Full Name & Email Address** (no passwords, OTP, magic links, or auth codes), instant guest access, and honest live connection status
+- 🏢 **Reference 2 Realistic Corporate Workplace** — Bright modern office layout with Reception area & guest terminal, 6 employee workstations with dual monitors & keyboards, glass executive conference suite with 75" display, acoustic focus booths, collaboration zone with rolling whiteboard, refreshment & espresso bar, breakout lounge with sectional sofa, and architectural walking paths with potted plants
+- 🪑 **Interactive Workstations & Sitting Mode** — Avatars can sit at desks and focus booths by pressing `E` or clicking "Sit Here", displaying active workstation halo and broadcasting occupancy across peers
+- 🧱 **Furniture Collision & Wall Sliding** — Full collision detection preventing avatars from passing through desks, tables, and reception counter, with smooth axis sliding along walls
+- 💬 **In-Room Text Chat** — Room-scoped real-time messaging with participant badges, timestamps, and auto-scrolling; conversations remain isolated per room
 - 🏢 **Multiple Office Rooms** — Public General Office, dedicated Meeting Room, and quiet Focus Room with live participant badges
-- 🔒 **Private Meeting Rooms** — Collision-free `PRV-XXXX` invitation codes, host transfer, 1-click code copying, and auto-cleanup
-- 🎨 **Avatar Customization** — Custom display names, 10-color palette, badge styles (Star, Crown, Diamond), and Online/Away status with `localStorage` caching
+- 🔒 **Private Meeting Rooms** — Collision-free `PRV-XXXX` invitation codes, host transfer tolerance, 1-click code copying, destructive leave confirmation dialog, and auto-cleanup
+- 🎨 **Avatar & Profile Customization** — Custom display names (XSS-sanitized), 10-color SaaS palette, badge styles (Star ⭐, Crown 👑, Diamond 💎), and 3-Tier Availability Statuses (**Online**, **Busy**, **Away**) with `localStorage` and MongoDB synchronization
+- 💎 **Premium SaaS Design** — Crisp white and soft off-white surfaces, blue & cyan accents, refined cards, restrained glassmorphism, accessible inline SVG icon library, and reduced-motion support
 - 👥 **Real-Time Presence** — Live avatars powered by Socket.IO; room-scoped join/leave events and movements
-- 🏃 **Avatar Movement** — WASD / arrow keys and on-screen direction pad; server-authoritative position clamping
+- 🏃 **Avatar Movement** — WASD / arrow keys and on-screen compass direction pad; server-authoritative position clamping
 - 📍 **Geospatial Proximity Engine** — MongoDB with `2dsphere` index; earshot radius filtering strictly within the same room
 - 🔊 **Spatial Voice Chat** — WebRTC peer connections with Web Audio API `GainNode` for smooth distance-based volume; automatic audio teardown on room switch
 - 🎤 **Microphone Controls** — Request, mute/unmute, and hardware-releasing turn-off controls with permission status
-- 📱 **Responsive UI** — Accessible desktop, tablet, and mobile layouts
+- 📱 **Responsive UI** — Accessible desktop, tablet, and mobile layouts with zero horizontal overflow
 
 ---
 
@@ -97,12 +102,15 @@ proxispeak/
         ├── App.jsx           # Main component — wires all hooks
         ├── App.css           # Full ProxiSpeak design system
         ├── index.css         # Global resets
+        ├── components/
+        │   ├── Icons.jsx          # Lightweight accessible inline SVG icons
+        │   └── WelcomePage.jsx    # Premium two-column welcome & join portal
         ├── services/
         │   └── socket.js     # Singleton Socket.IO client
         ├── hooks/
-        │   ├── useSocket.js       # Presence, movement, reconnect
-        │   ├── useOfficeCanvas.js # Canvas drawing loop
-        │   └── useWebRTC.js       # WebRTC + spatial audio
+        │   ├── useSocket.js       # Presence, room sync, profile customization
+        │   ├── useOfficeCanvas.js # 2D canvas drawing loop with 3-tier statuses
+        │   └── useWebRTC.js       # WebRTC mesh + spatial audio GainNodes
         └── utils/
             └── proximity.js  # Distance, nearby filter, volume curve
 ```
@@ -372,9 +380,9 @@ Branch naming convention: `feature/`, `fix/`, `docs/`, `test/`
 |-----------|--------|
 | **WebRTC P2P scaling** | Full-mesh WebRTC becomes expensive above ~10 simultaneous voice users. Each user maintains N-1 peer connections. For 50+ voice users, a Selective Forwarding Unit (SFU) like mediasoup or LiveKit is recommended. |
 | **TURN server** | Users behind symmetric NATs or corporate firewalls may fail WebRTC connectivity. A TURN server (e.g., Coturn) is required for production. Never hardcode TURN credentials — inject via environment variables. |
-| **No authentication** | Users join as anonymous guests. Adding authentication is out of scope for this phase. |
-| **Single room** | All users share one virtual office. Multiple rooms require Socket.IO room routing. |
-| **Load tested** | Manual testing to ~10 concurrent users on a local machine. 50+ users requires horizontal scaling and an SFU. |
+| **No authentication** | Users join as anonymous guests with customizable display names and avatars. Full enterprise authentication (OAuth/SSO) is planned for future milestones. |
+| **Private room persistence** | Private meeting rooms (`PRV-XXXX`) are maintained in server memory with automatic cleanup when all members leave. They reset on server restart, while user sessions and positions are indexed in MongoDB. |
+| **Load tested** | Manual testing validated to ~10 concurrent users on a local machine. 50+ users requires horizontal scaling and an SFU. |
 
 ---
 

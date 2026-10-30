@@ -1,32 +1,59 @@
 /**
- * App.jsx — ProxiSpeak main component
+ * App.jsx — ProxiSpeak Main Application
  *
- * Wires together:
- *  • useSocket  → real-time presence and movement
- *  • useOfficeCanvas → 2D office map rendering
- *  • useWebRTC  → proximity-based voice audio
- *  • Keyboard + button movement
- *  • Nearby-user detection
- *  • Mic / mute controls
+ * Full-stack spatial audio collaboration platform featuring:
+ *  • useSocket        → real-time presence, multi-room sync, and profile customization
+ *  • useOfficeCanvas   → 2D office floor plan rendering with 3-tier statuses & badges
+ *  • useWebRTC        → proximity-attenuated WebRTC audio mesh
+ *  • Premium SaaS UI   → SVG icon system, blue/cyan theme, accessible modals & confirmations
  */
 import { useEffect, useRef, useState, useCallback } from 'react';
 import './App.css';
 
 import { useSocket }       from './hooks/useSocket.js';
-import { useOfficeCanvas } from './hooks/useOfficeCanvas.js';
+import { useOfficeCanvas, checkCollision, findNearbyWorkstation } from './hooks/useOfficeCanvas.js';
 import { useWebRTC }       from './hooks/useWebRTC.js';
 import { getNearbyUsers, EARSHOT_RADIUS, volumeFromDistance } from './utils/proximity.js';
+import { WelcomePage }     from './components/WelcomePage.jsx';
 
-// Canvas logical size (must match server-side clamp values)
+import {
+  BuildingIcon,
+  UsersIcon,
+  HeadphonesIcon,
+  LockIcon,
+  PlusIcon,
+  KeyIcon,
+  SlidersIcon,
+  MicIcon,
+  MicOffIcon,
+  MicDeniedIcon,
+  CopyIcon,
+  CheckIcon,
+  LogOutIcon,
+  CloseIcon,
+  RadioIcon,
+  VolumeIcon,
+  AlertCircleIcon,
+  InfoIcon,
+  ChevronUpIcon,
+  ChevronDownIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  StarIcon,
+  CrownIcon,
+  DiamondIcon,
+} from './components/Icons.jsx';
+
+// Logical canvas bounds matching server-side clamping
 const CANVAS_W = 800;
 const CANVAS_H = 500;
-const STEP     = 15; // pixels per key press
-// Throttle move events to at most 1 per 50 ms (20 Hz)
-const MOVE_THROTTLE_MS = 50;
+const STEP     = 15; // pixels per movement action
+const MOVE_THROTTLE_MS = 50; // at most 20 Hz movement events
 
+// Curated 10-color SaaS palette
 const PALETTE = [
-  '#259765', '#6478d9', '#d9647a', '#d9a064', '#64c8d9',
-  '#9664d9', '#64d978', '#d9d064', '#d964c8', '#06b6d4',
+  '#2563eb', '#06b6d4', '#8b5cf6', '#ec4899', '#f59e0b',
+  '#10b981', '#3b82f6', '#6366f1', '#14b8a6', '#64748b',
 ];
 
 const STYLES = [
@@ -36,50 +63,12 @@ const STYLES = [
   { id: 'diamond', label: 'Diamond', icon: '💎' },
 ];
 
-// ── Mic icon helpers ────────────────────────────────────────────────────────
-function MicIcon({ state }) {
-  const icons = {
-    idle:       '🎤',
-    requesting: '⏳',
-    active:     '🎤',
-    muted:      '🔇',
-    denied:     '🚫',
-    error:      '⚠️',
-  };
-  return <span style={{ fontSize: 16 }}>{icons[state] ?? '🎤'}</span>;
-}
-
-function micLabel(state) {
-  switch (state) {
-    case 'idle':       return 'Enable Microphone';
-    case 'requesting': return 'Requesting access…';
-    case 'active':     return 'Mute Mic';
-    case 'muted':      return 'Unmute Mic';
-    case 'denied':     return 'Microphone Denied';
-    case 'error':      return 'Mic Error — Retry';
-    default:           return 'Microphone';
-  }
-}
-
-function micDotClass(state) {
-  if (state === 'active')  return 'mic-status-dot active';
-  if (state === 'muted')   return 'mic-status-dot muted';
-  if (state === 'denied')  return 'mic-status-dot denied';
-  return 'mic-status-dot';
-}
-
-function micBtnClass(state) {
-  if (state === 'muted')  return 'mic-btn muted';
-  if (state === 'denied') return 'mic-btn denied';
-  return 'mic-btn';
-}
-
-// ── App ─────────────────────────────────────────────────────────────────────
 export default function App() {
   const canvasRef = useRef(null);
 
-  // Socket presence & rooms
+  // Socket.IO presence, rooms, and profile state
   const {
+    socket,
     connected,
     connecting,
     myId,
@@ -90,16 +79,22 @@ export default function App() {
     roomCounts,
     roomError,
     profile,
+    roomMessages,
+    occupiedDesks,
+    currentWorkstation,
     emitMove,
-    emitMicStatus: _emitMicStatus,
     joinRoom,
+    leaveOffice,
     createPrivateRoom,
     leavePrivateRoom,
     updateProfile,
+    sendRoomChat,
+    sitAtWorkstation,
+    leaveWorkstation,
     clearRoomError,
   } = useSocket();
 
-  // WebRTC audio
+  // WebRTC spatial audio mesh
   const {
     micState,
     audioConnections,
@@ -111,75 +106,221 @@ export default function App() {
     cleanAllPeers,
   } = useWebRTC(myId);
 
-  // Canvas drawing
-  useOfficeCanvas(canvasRef, usersRef, myId, currentRoom, roomInfo);
+  // Office entry gate: Welcome / Login page appears first
+  const [hasJoined, setHasJoined] = useState(false);
 
-  // Clean WebRTC peer audio connections when switching rooms
+  // 2D office canvas renderer
+  useOfficeCanvas(canvasRef, usersRef, myId, currentRoom, roomInfo, profile);
+
+  // Teardown previous audio connections on room changes
   useEffect(() => {
     cleanAllPeers();
   }, [currentRoom, cleanAllPeers]);
 
-  // Nearby users computed from latest positions
+  // If a room error occurs (e.g. invalid invite code), keep user on welcome screen
+  useEffect(() => {
+    if (roomError) {
+      setHasJoined(false);
+    }
+  }, [roomError]);
+
+  // Nearby users computed from authoritative positions
   const [nearbyUsers, setNearbyUsers] = useState([]);
 
-  // Modals state
-  const [showCustomizer, setShowCustomizer]   = useState(false);
-  const [showCreateModal, setShowCreateModal] = useState(false);
-  const [showJoinModal, setShowJoinModal]     = useState(false);
-  const [privateTitle, setPrivateTitle]       = useState('');
-  const [inviteCodeInput, setInviteCodeInput] = useState('');
-  const [copiedCode, setCopiedCode]           = useState(false);
+  // Modals & UI interactive state
+  const [showCustomizer, setShowCustomizer]     = useState(false);
+  const [showCreateModal, setShowCreateModal]   = useState(false);
+  const [showJoinModal, setShowJoinModal]       = useState(false);
+  const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
+  const [privateTitle, setPrivateTitle]         = useState('');
+  const [inviteCodeInput, setInviteCodeInput]   = useState('');
+  const [copiedCode, setCopiedCode]             = useState(false);
 
-  // Profile editing state inside customizer modal
+  // Workstation interaction & In-Room Chat state
+  const [nearbyDesk, setNearbyDesk] = useState(null);
+  const [sidebarTab, setSidebarTab] = useState('teammates'); // 'teammates' | 'chat'
+  const [chatInput, setChatInput]   = useState('');
+  const chatBottomRef = useRef(null);
+
+  // Editable profile state inside customizer modal
   const [editProfile, setEditProfile] = useState(profile);
 
   // Movement throttle ref
   const lastMoveRef = useRef(0);
 
-  // ── Movement ──────────────────────────────────────────────────────────────
+  // ── Welcome Screen Join Handler ───────────────────────────────────────────
+  const handleJoinOffice = useCallback(
+    ({ name, email, room, code }) => {
+      return new Promise((resolve, reject) => {
+        if (!connected) {
+          reject(new Error('Backend server is offline or unreachable. Please start backend on port 5000.'));
+          return;
+        }
+
+        const targetRoom = room || 'general';
+        updateProfile({ name, email });
+
+        let settled = false;
+
+        const onSettled = (success, errorMsg) => {
+          if (settled) return;
+          settled = true;
+          socket.off('room-info', onRoomInfo);
+          socket.off('room-error', onRoomError);
+          clearTimeout(timeoutId);
+
+          if (success) {
+            setHasJoined(true);
+            resolve();
+          } else {
+            reject(new Error(errorMsg || 'Failed to join room.'));
+          }
+        };
+
+        const onRoomInfo = () => onSettled(true);
+        const onRoomError = ({ message }) => onSettled(false, message);
+
+        socket.once('room-info', onRoomInfo);
+        socket.once('room-error', onRoomError);
+
+        const timeoutId = setTimeout(() => {
+          onSettled(false, 'Join request timed out. Please verify your connection.');
+        }, 5000);
+
+        joinRoom(targetRoom, code, { ...profile, name, email }, (res) => {
+          if (res) {
+            if (res.success) {
+              onSettled(true);
+            } else {
+              onSettled(false, res.error);
+            }
+          }
+        });
+      });
+    },
+    [connected, updateProfile, joinRoom, profile, socket]
+  );
+
+  // ── Leave Office (Return to Welcome Screen) ───────────────────────────────
+  const handleLeaveOffice = useCallback(() => {
+    cleanAllPeers();
+    disableMic();
+    leaveOffice();
+    setHasJoined(false);
+    clearRoomError();
+  }, [cleanAllPeers, disableMic, leaveOffice, clearRoomError]);
+
+  // ── Movement Handler with Furniture Collision & Sliding ────────────────────
   const move = useCallback(
     (dx, dy) => {
       const now = performance.now();
       if (now - lastMoveRef.current < MOVE_THROTTLE_MS) return;
       lastMoveRef.current = now;
 
-      const me = usersRef.current.find((u) => u.id === myId);
+      const me = usersRef.current.find((u) => u.id === myId) || usersRef.current[0];
       if (!me) return;
 
-      const nx = Math.max(20, Math.min(CANVAS_W - 20, me.x + dx));
-      const ny = Math.max(20, Math.min(CANVAS_H - 20, me.y + dy));
+      let nx = Math.max(20, Math.min(CANVAS_W - 20, me.x + dx));
+      let ny = Math.max(20, Math.min(CANVAS_H - 20, me.y + dy));
+
+      // Realistic obstacle collision with wall/desk sliding
+      if (checkCollision(nx, ny, 10, currentRoom)) {
+        if (!checkCollision(nx, me.y, 10, currentRoom)) {
+          // Slide along X axis
+          ny = me.y;
+        } else if (!checkCollision(me.x, ny, 10, currentRoom)) {
+          // Slide along Y axis
+          nx = me.x;
+        } else {
+          // Fully blocked by obstacle
+          return;
+        }
+      }
+
+      // Automatically leave workstation if user walks away
+      if (currentWorkstation && (nx !== me.x || ny !== me.y)) {
+        const d = Math.hypot(currentWorkstation.x - nx, currentWorkstation.y - ny);
+        if (d > 35) {
+          leaveWorkstation();
+        }
+      }
+
       emitMove(nx, ny);
     },
-    [myId, usersRef, emitMove]
+    [myId, usersRef, currentRoom, currentWorkstation, leaveWorkstation, emitMove]
   );
 
-  // Keyboard movement
+  // Keyboard navigation & Workstation interaction (WASD + E)
   useEffect(() => {
+    if (!hasJoined) return;
     const onKeyDown = (e) => {
+      // Don't intercept when user is typing inside text input fields
+      if (['INPUT', 'TEXTAREA'].includes(e.target?.tagName)) return;
+
       if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','w','a','s','d'].includes(e.key)) {
-        e.preventDefault();
+        if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) {
+          e.preventDefault();
+        }
       }
       if (e.key === 'ArrowUp'    || e.key === 'w') move(0, -STEP);
       if (e.key === 'ArrowDown'  || e.key === 's') move(0,  STEP);
       if (e.key === 'ArrowLeft'  || e.key === 'a') move(-STEP, 0);
       if (e.key === 'ArrowRight' || e.key === 'd') move( STEP, 0);
+
+      // Key E: Sit / Leave Workstation
+      if (e.key === 'e' || e.key === 'E') {
+        if (currentWorkstation) {
+          leaveWorkstation();
+        } else if (nearbyDesk) {
+          const occ = occupiedDesks[nearbyDesk.id];
+          if (!occ || occ.socketId === myId) {
+            sitAtWorkstation(nearbyDesk);
+          }
+        }
+      }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [move]);
+  }, [move, hasJoined, currentWorkstation, nearbyDesk, occupiedDesks, myId, sitAtWorkstation, leaveWorkstation]);
 
-  // ── Proximity & volume updates ────────────────────────────────────────────
+  // Track nearest workstation within interaction radius
+  useEffect(() => {
+    const me = usersRef.current.find((u) => u.id === myId);
+    if (!me || currentRoom !== 'general') {
+      setNearbyDesk(null);
+      return;
+    }
+    const desk = findNearbyWorkstation(me.x, me.y, 35);
+    setNearbyDesk(desk);
+  }, [users, myId, currentRoom, usersRef]);
+
+  // Auto-scroll chat messages container when new message arrives
+  useEffect(() => {
+    if (sidebarTab === 'chat' && chatBottomRef.current) {
+      chatBottomRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [roomMessages, sidebarTab]);
+
+  // ── Send In-Room Chat Message ──────────────────────────────────────────────
+  const handleSendChat = (e) => {
+    e.preventDefault();
+    if (!chatInput.trim()) return;
+    sendRoomChat(chatInput);
+    setChatInput('');
+  };
+
+  // ── Proximity & Spatial Gain Updates ──────────────────────────────────────
   useEffect(() => {
     const me = users.find((u) => u.id === myId);
     if (!me) return;
 
-    const others  = users.filter((u) => u.id !== myId);
-    const nearby  = getNearbyUsers(me, others, EARSHOT_RADIUS);
+    const others = users.filter((u) => u.id !== myId);
+    const nearby = getNearbyUsers(me, others, EARSHOT_RADIUS);
     setNearbyUsers(nearby);
     updateVolumes(nearby, users);
   }, [users, myId, updateVolumes]);
 
-  // ── Mic click handler ─────────────────────────────────────────────────────
+  // ── Microphone Click Handler ──────────────────────────────────────────────
   const handleMicClick = () => {
     if (micState === 'idle' || micState === 'error') {
       requestMic();
@@ -188,20 +329,7 @@ export default function App() {
     }
   };
 
-  // ── Status text ───────────────────────────────────────────────────────────
-  const connectionLabel = connecting
-    ? 'Connecting…'
-    : connected
-    ? 'Connected to office'
-    : 'Disconnected';
-
-  const dotClass = connecting
-    ? 'status-dot'
-    : connected
-    ? 'status-dot online'
-    : 'status-dot error';
-
-  // ── Handlers ─────────────────────────────────────────────────────────────
+  // ── Customizer Handlers ───────────────────────────────────────────────────
   const openCustomizer = () => {
     setEditProfile(profile);
     setShowCustomizer(true);
@@ -212,6 +340,7 @@ export default function App() {
     setShowCustomizer(false);
   };
 
+  // ── Private Meeting Handlers ──────────────────────────────────────────────
   const handleCreateMeeting = (e) => {
     e.preventDefault();
     if (privateTitle.trim()) {
@@ -238,15 +367,65 @@ export default function App() {
     }
   };
 
+  const confirmLeavePrivate = () => {
+    leavePrivateRoom();
+    setShowLeaveConfirm(false);
+  };
+
+  // ── Connection Status Details ─────────────────────────────────────────────
+  const connectionLabel = connecting
+    ? 'Connecting to office…'
+    : connected
+    ? 'Connected'
+    : 'Disconnected';
+
+  const dotClass = connecting
+    ? 'status-dot'
+    : connected
+    ? 'status-dot online'
+    : 'status-dot error';
+
+  const statusColor = (status) => {
+    if (status === 'busy') return '#ef4444';
+    if (status === 'away') return '#f59e0b';
+    return '#10b981';
+  };
+
   // ── Render ────────────────────────────────────────────────────────────────
+  if (!hasJoined) {
+    return (
+      <WelcomePage
+        onJoin={handleJoinOffice}
+        connected={connected}
+        connecting={connecting}
+        initialProfile={profile}
+        roomCounts={roomCounts}
+        serverError={roomError}
+        clearServerError={clearRoomError}
+      />
+    );
+  }
+
   return (
     <main className="app-shell">
-      {/* ── Top Bar ─────────────────────────────────────────────────────── */}
+      {/* ── Top Navigation Bar ─────────────────────────────────────────────── */}
       <header className="topbar">
         <a className="brand" href="/" aria-label="ProxiSpeak home">
-          <span className="brand-icon">P</span>
-          <span>ProxiSpeak</span>
+          <div className="brand-icon">
+            <RadioIcon size={20} />
+          </div>
+          <div className="brand-title">
+            <span className="brand-name">ProxiSpeak</span>
+            <span className="brand-tag">Spatial Office</span>
+          </div>
         </a>
+
+        <div className="topbar-center">
+          <div className={`topbar-room-badge ${roomInfo.isPrivate ? 'private' : ''}`}>
+            {roomInfo.isPrivate ? <LockIcon size={14} /> : <BuildingIcon size={14} />}
+            <span>{roomInfo.title || 'General Office'}</span>
+          </div>
+        </div>
 
         <div className="topbar-right">
           {connecting && (
@@ -255,30 +434,65 @@ export default function App() {
               Connecting…
             </div>
           )}
+
           <div className="connection" role="status" aria-live="polite">
             <span className={dotClass} />
-            {connectionLabel}
+            <span>{connectionLabel}</span>
           </div>
+
+          <button
+            type="button"
+            className="topbar-user-pill"
+            onClick={openCustomizer}
+            title="Edit profile & avatar"
+            aria-label={`Profile: ${profile.name || 'You'}`}
+          >
+            <div
+              className="topbar-user-avatar"
+              style={{ background: profile.avatarColor || '#2563eb' }}
+            >
+              {(profile.name || 'ME').slice(0, 2).toUpperCase()}
+            </div>
+            <span>{profile.name || 'Guest'}</span>
+            <span
+              className={`status-indicator-dot ${profile.status || 'online'}`}
+              style={{ width: 7, height: 7 }}
+            />
+          </button>
+
+          <button
+            type="button"
+            className="btn-leave-office"
+            onClick={handleLeaveOffice}
+            title="Leave virtual office and return to welcome page"
+            aria-label="Leave office"
+          >
+            <LogOutIcon size={14} />
+            <span>Leave Office</span>
+          </button>
         </div>
       </header>
 
       <div className="page-content">
-        {/* ── Welcome Banner ──────────────────────────────────────────────── */}
+        {/* ── Welcome Header ──────────────────────────────────────────────── */}
         <section className="welcome">
           <div>
-            <p className="eyebrow">Your Virtual Workspace</p>
+            <div className="eyebrow">
+              <RadioIcon size={13} />
+              <span>Real-Time Geospatial Audio</span>
+            </div>
             <h1>Work better, <span>together.</span></h1>
             <p className="subtitle">
-              Move around the office. Talk to people nearby automatically.
+              Move your avatar across the office. Audio volume attenuates naturally with proximity.
             </p>
           </div>
-          <div className="people-count" aria-label={`${users.length} people in this room`}>
+          <div className="people-count" aria-label={`${users.length} teammates in this room`}>
             <span className="count-number">{users.length}</span>
             <span>In this room</span>
           </div>
         </section>
 
-        {/* ── Phase 3: Room Switcher Bar ──────────────────────────────────── */}
+        {/* ── Room Navigation Toolbar ─────────────────────────────────────── */}
         <nav className="room-bar-container" aria-label="Office room navigation">
           <div className="room-tabs" role="tablist">
             <button
@@ -287,34 +501,41 @@ export default function App() {
               role="tab"
               aria-selected={currentRoom === 'general'}
             >
-              🏢 General Office
+              <BuildingIcon size={15} />
+              <span>General Office</span>
               <span className="room-badge">{roomCounts.general || 0}</span>
             </button>
+
             <button
               className={`room-tab ${currentRoom === 'meeting' ? 'active' : ''}`}
               onClick={() => joinRoom('meeting')}
               role="tab"
               aria-selected={currentRoom === 'meeting'}
             >
-              👥 Meeting Room
+              <UsersIcon size={15} />
+              <span>Meeting Room</span>
               <span className="room-badge">{roomCounts.meeting || 0}</span>
             </button>
+
             <button
               className={`room-tab ${currentRoom === 'focus' ? 'active' : ''}`}
               onClick={() => joinRoom('focus')}
               role="tab"
               aria-selected={currentRoom === 'focus'}
             >
-              🎧 Focus Room
+              <HeadphonesIcon size={15} />
+              <span>Focus Room</span>
               <span className="room-badge">{roomCounts.focus || 0}</span>
             </button>
+
             {roomInfo.isPrivate && (
               <button
                 className="room-tab private-active"
                 role="tab"
                 aria-selected="true"
               >
-                🔒 {roomInfo.title}
+                <LockIcon size={15} />
+                <span>{roomInfo.title}</span>
                 <span className="room-badge">{users.length}</span>
               </button>
             )}
@@ -322,31 +543,33 @@ export default function App() {
 
           <div className="room-actions">
             <button
+              type="button"
               className="btn-secondary-action"
               onClick={() => setShowCreateModal(true)}
-              aria-label="Create private meeting"
+              aria-label="Create new private meeting"
             >
-              ➕ New Meeting
+              <PlusIcon size={14} />
+              <span>New Meeting</span>
             </button>
+
             <button
+              type="button"
               className="btn-secondary-action"
               onClick={() => setShowJoinModal(true)}
-              aria-label="Join meeting with code"
+              aria-label="Join meeting with invitation code"
             >
-              🔑 Join by Code
+              <KeyIcon size={14} />
+              <span>Join by Code</span>
             </button>
+
             <button
+              type="button"
               className="btn-customize"
               onClick={openCustomizer}
-              aria-label="Customize avatar and profile"
+              aria-label="Customize avatar and identity"
             >
-              <span
-                className="user-avatar-pip"
-                style={{ background: profile.avatarColor || '#259765' }}
-              >
-                {(profile.name || 'ME').slice(0, 2).toUpperCase()}
-              </span>
-              Customize Avatar
+              <SlidersIcon size={14} />
+              <span>Customize Profile</span>
             </button>
           </div>
         </nav>
@@ -354,11 +577,15 @@ export default function App() {
         {/* ── Room Notices & Error Alerts ─────────────────────────────────── */}
         {roomError && (
           <div className="room-banner error" role="alert">
-            <span>⚠️ {roomError}</span>
+            <div className="banner-left">
+              <AlertCircleIcon size={16} />
+              <span>{roomError}</span>
+            </div>
             <button
+              type="button"
               onClick={clearRoomError}
               className="btn-leave-meeting"
-              style={{ padding: '3px 8px', fontSize: 11 }}
+              style={{ padding: '3px 10px', fontSize: 11 }}
             >
               Dismiss
             </button>
@@ -367,46 +594,59 @@ export default function App() {
 
         {currentRoom === 'focus' && (
           <div className="room-banner focus" role="status">
-            <span>
-              🌿 <strong>Focus Room</strong> — Quiet zone for uninterrupted deep work.
-              Your microphone remains strictly under your manual control.
-            </span>
+            <div className="banner-left">
+              <InfoIcon size={16} />
+              <span>
+                <strong>Focus Room</strong> — Quiet zone for deep focus. Audio transmission is restricted to immediate earshot.
+              </span>
+            </div>
           </div>
         )}
 
         {roomInfo.isPrivate && (
           <div className="room-banner private" role="status">
             <div className="private-meta-group">
-              <span>🔒 <strong>Private Meeting:</strong> {roomInfo.title}</span>
+              <div className="banner-left">
+                <LockIcon size={16} />
+                <span><strong>Private Meeting:</strong> {roomInfo.title}</span>
+              </div>
               <span className="code-pill">
-                Code: {roomInfo.code}
+                <span>Code:</span>
+                <strong>{roomInfo.code}</strong>
                 <button
+                  type="button"
                   className="btn-copy-code"
                   onClick={handleCopyCode}
                   aria-label="Copy invitation code"
                 >
-                  {copiedCode ? '✓ Copied!' : '📋 Copy'}
+                  {copiedCode ? <CheckIcon size={12} /> : <CopyIcon size={12} />}
+                  <span>{copiedCode ? 'Copied!' : 'Copy'}</span>
                 </button>
               </span>
             </div>
             <button
+              type="button"
               className="btn-leave-meeting"
-              onClick={leavePrivateRoom}
+              onClick={() => setShowLeaveConfirm(true)}
               aria-label="Leave private meeting"
             >
-              Leave Meeting
+              <LogOutIcon size={13} />
+              <span>Leave Meeting</span>
             </button>
           </div>
         )}
 
-        {/* ── Main Grid ───────────────────────────────────────────────────── */}
+        {/* ── Main Workspace Grid ─────────────────────────────────────────── */}
         <div className="office-grid">
-          {/* ── Office Canvas Card ──────────────────────────────────────── */}
+          {/* ── Office Canvas Section ─────────────────────────────────────── */}
           <section className="card" aria-label="Virtual office map">
             <div className="card-header">
               <div>
-                <h2>{roomInfo.title || 'Virtual Office'}</h2>
-                <p>Live workspace · Room: {roomInfo.room || currentRoom}</p>
+                <h2>
+                  <BuildingIcon size={16} />
+                  <span>{roomInfo.title || 'Virtual Office Floor'}</span>
+                </h2>
+                <p>Live collaborative workspace · Space: {roomInfo.room || currentRoom}</p>
               </div>
               {connected && (
                 <span className="live-label">
@@ -418,94 +658,142 @@ export default function App() {
 
             <div className="canvas-wrap">
               {!connected && !connecting && (
-                <div
-                  style={{
-                    position: 'absolute', inset: 0,
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    background: 'rgba(243, 248, 245, 0.85)',
-                    fontSize: 14, color: 'var(--text-muted)', gap: 10,
-                    zIndex: 10,
-                  }}
-                >
-                  <span style={{ fontSize: 24 }}>🔌</span>
-                  Office offline — check your connection
+                <div className="canvas-offline-toast" role="status">
+                  <span className="offline-badge">OFFLINE PREVIEW</span>
+                  <span>
+                    Server offline. Start with <code>npm --prefix backend run dev</code> to connect.
+                  </span>
                 </div>
               )}
               <canvas
                 ref={canvasRef}
-                aria-label="Virtual office map showing user avatars"
+                aria-label="Interactive 2D virtual office map showing participant avatars"
                 style={{ cursor: 'crosshair' }}
               />
             </div>
 
+            {/* Interactive Workstation Sitting Prompt */}
+            {currentWorkstation ? (
+              <div className="workstation-prompt-pill active" role="status">
+                <span className="desk-indicator">🪑</span>
+                <span className="desk-prompt-text">
+                  Working at <strong>{currentWorkstation.name}</strong> ({currentWorkstation.zone})
+                </span>
+                <button
+                  type="button"
+                  className="btn-workstation-action"
+                  onClick={leaveWorkstation}
+                  title="Stand up (or press E)"
+                >
+                  Leave Desk (E)
+                </button>
+              </div>
+            ) : nearbyDesk ? (
+              <div className="workstation-prompt-pill" role="status">
+                <span className="desk-indicator">🪑</span>
+                <span className="desk-prompt-text">
+                  Near <strong>{nearbyDesk.name}</strong> ({nearbyDesk.zone})
+                  {occupiedDesks[nearbyDesk.id] ? ` · Occupied by ${occupiedDesks[nearbyDesk.id].name}` : ''}
+                </span>
+                {!occupiedDesks[nearbyDesk.id] ? (
+                  <button
+                    type="button"
+                    className="btn-workstation-action"
+                    onClick={() => sitAtWorkstation(nearbyDesk)}
+                    title="Sit down at desk (or press E)"
+                  >
+                    Sit Here (E)
+                  </button>
+                ) : (
+                  <span className="desk-occupied-badge">Occupied</span>
+                )}
+              </div>
+            ) : null}
+
             <div className="office-footer">
-              <span><i className="legend-dot my-dot" />Your avatar</span>
-              <span><i className="legend-dot other-dot" />Room participants</span>
+              <span><i className="legend-dot my-dot" />You</span>
+              <span><i className="legend-dot other-dot" />Teammates</span>
               {nearbyUsers.length > 0 && (
-                <span style={{ color: 'var(--accent)', fontWeight: 600 }}>
-                  🔊 {nearbyUsers.length} nearby in room
+                <span style={{ color: 'var(--primary-600)', fontWeight: 700 }}>
+                  <VolumeIcon size={14} />
+                  <span>{nearbyUsers.length} in earshot</span>
                 </span>
               )}
-              <span className="movement-hint">Move: WASD or arrow keys</span>
+              <span className="movement-hint">Move: WASD or Arrow Keys · Sit: E</span>
             </div>
           </section>
 
-          {/* ── Right Sidebar ────────────────────────────────────────────── */}
+          {/* ── Right Sidebar ─────────────────────────────────────────────── */}
           <aside className="sidebar">
-            {/* Controls */}
+            {/* Movement Controls Card */}
             <div className="card controls-card">
               <div className="card-header">
                 <div>
-                  <h2>Move Avatar</h2>
-                  <p>Keyboard or buttons</p>
+                  <h2>Direction Controls</h2>
+                  <p>Move avatar across office</p>
                 </div>
               </div>
               <div className="card-body">
-                <p className="section-label">Direction</p>
-                <div className="direction-pad" role="group" aria-label="Avatar movement controls">
-                  <button data-dir="up"    onClick={() => move(0, -STEP)} aria-label="Move up">↑</button>
-                  <button data-dir="left"  onClick={() => move(-STEP, 0)} aria-label="Move left">←</button>
-                  <button data-dir="down"  onClick={() => move(0,  STEP)} aria-label="Move down">↓</button>
-                  <button data-dir="right" onClick={() => move( STEP, 0)} aria-label="Move right">→</button>
+                <p className="section-label">Compass Pad</p>
+                <div className="direction-pad" role="group" aria-label="Avatar direction navigation buttons">
+                  <button data-dir="up"    onClick={() => move(0, -STEP)} aria-label="Move up"><ChevronUpIcon size={18} /></button>
+                  <button data-dir="left"  onClick={() => move(-STEP, 0)} aria-label="Move left"><ChevronLeftIcon size={18} /></button>
+                  <button data-dir="down"  onClick={() => move(0,  STEP)} aria-label="Move down"><ChevronDownIcon size={18} /></button>
+                  <button data-dir="right" onClick={() => move( STEP, 0)} aria-label="Move right"><ChevronRightIcon size={18} /></button>
                 </div>
               </div>
             </div>
 
-            {/* Microphone */}
+            {/* Voice & Microphone Card */}
             <div className="card">
               <div className="card-header">
                 <div>
-                  <h2>Voice Chat</h2>
-                  <p>Room-scoped proximity audio</p>
+                  <h2>Proximity Audio</h2>
+                  <p>Room-scoped spatial voice</p>
                 </div>
               </div>
               <div className="card-body">
                 <div className="mic-status" role="status" aria-live="polite">
-                  <span className={micDotClass(micState)} />
+                  <span className={`mic-status-dot ${micState}`} />
                   {micState === 'idle'       && 'Microphone off'}
-                  {micState === 'requesting' && 'Requesting…'}
-                  {micState === 'active'     && 'Mic active'}
-                  {micState === 'muted'      && 'Muted'}
-                  {micState === 'denied'     && 'Permission denied'}
-                  {micState === 'error'      && 'Mic error'}
+                  {micState === 'requesting' && 'Requesting access…'}
+                  {micState === 'active'     && 'Microphone active'}
+                  {micState === 'muted'      && 'Microphone muted'}
+                  {micState === 'denied'     && 'Microphone permission denied'}
+                  {micState === 'error'      && 'Microphone hardware error'}
                 </div>
 
                 <div className="mic-actions">
                   <button
-                    className={micBtnClass(micState)}
+                    type="button"
+                    className={`mic-btn ${micState === 'muted' ? 'muted' : micState === 'denied' ? 'denied' : ''}`}
                     onClick={handleMicClick}
                     disabled={micState === 'requesting' || micState === 'denied'}
-                    aria-label={micLabel(micState)}
+                    aria-label={micState === 'active' ? 'Mute microphone' : 'Enable microphone'}
                   >
-                    <MicIcon state={micState} />
-                    {micLabel(micState)}
+                    {micState === 'active' ? (
+                      <MicIcon size={16} />
+                    ) : micState === 'denied' ? (
+                      <MicDeniedIcon size={16} />
+                    ) : (
+                      <MicOffIcon size={16} />
+                    )}
+                    <span>
+                      {micState === 'idle'       && 'Enable Microphone'}
+                      {micState === 'requesting' && 'Requesting Access…'}
+                      {micState === 'active'     && 'Mute Microphone'}
+                      {micState === 'muted'      && 'Unmute Microphone'}
+                      {micState === 'denied'     && 'Access Denied'}
+                      {micState === 'error'      && 'Retry Microphone'}
+                    </span>
                   </button>
 
                   {(micState === 'active' || micState === 'muted') && (
                     <button
+                      type="button"
                       className="mic-secondary-btn"
                       onClick={disableMic}
-                      aria-label="Turn off microphone"
+                      aria-label="Turn off microphone stream"
                     >
                       Turn Off Microphone
                     </button>
@@ -514,78 +802,183 @@ export default function App() {
 
                 {webrtcError && (
                   <div className="webrtc-error-box" role="alert">
-                    ⚠️ {webrtcError}
+                    <AlertCircleIcon size={14} />
+                    <span>{webrtcError}</span>
                   </div>
                 )}
 
                 {audioConnections > 0 && (
                   <p className="mic-hint">
-                    🔊 Audio connected to {audioConnections} peer{audioConnections > 1 ? 's' : ''} in this room
+                    Audio connected to {audioConnections} peer{audioConnections > 1 ? 's' : ''} in this space
                   </p>
                 )}
                 {micState === 'idle' && (
                   <p className="mic-hint">
-                    Click to enable proximity voice chat. Volume scales with distance inside {roomInfo.title || 'this room'}.
+                    Enable your microphone to chat with nearby teammates. Audio volume scales smoothly with distance.
                   </p>
                 )}
                 {micState === 'denied' && (
                   <p className="mic-hint">
-                    Allow microphone access in your browser settings and refresh the page.
+                    Microphone access was denied. Check your browser privacy permissions and reload.
                   </p>
                 )}
               </div>
             </div>
 
-            {/* Participants in Current Room */}
-            <div className="card">
-              <div className="card-header">
-                <div>
-                  <h2>Room Participants</h2>
-                  <p>{roomInfo.title} ({users.length})</p>
-                </div>
+            {/* Tabbed Teammates & Room Chat Card */}
+            <div className="card tabbed-sidebar-card">
+              <div className="sidebar-tab-bar" role="tablist" aria-label="Sidebar navigation">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={sidebarTab === 'teammates'}
+                  className={`sidebar-tab-btn ${sidebarTab === 'teammates' ? 'active' : ''}`}
+                  onClick={() => setSidebarTab('teammates')}
+                >
+                  <UsersIcon size={14} />
+                  <span>Teammates</span>
+                  <span className="tab-counter-badge">{users.length}</span>
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={sidebarTab === 'chat'}
+                  className={`sidebar-tab-btn ${sidebarTab === 'chat' ? 'active' : ''}`}
+                  onClick={() => setSidebarTab('chat')}
+                >
+                  <span>💬</span>
+                  <span>In-Room Chat</span>
+                  {roomMessages.length > 0 && (
+                    <span className="tab-counter-badge">{roomMessages.length}</span>
+                  )}
+                </button>
               </div>
-              <div className="card-body">
-                <div className="nearby-list" aria-live="polite" aria-label="Room participants">
-                  {users.map((u) => {
-                    const isMe = u.id === myId;
-                    const nearbyInfo = nearbyUsers.find((n) => n.user.id === u.id);
-                    const isAway = u.status === 'away';
-                    const initials = (u.name || (isMe ? 'ME' : 'GU')).slice(0, 2).toUpperCase();
 
-                    return (
-                      <div key={u.id} className="nearby-user-row">
-                        <div
-                          className="nearby-avatar"
-                          style={{ background: u.avatarColor || (isMe ? '#259765' : '#6478d9') }}
-                        >
-                          {initials}
-                        </div>
-                        <span className="nearby-user-name">
-                          {u.name || 'Guest'} {isMe && '(You)'}
-                        </span>
-                        <div className="nearby-meta">
-                          <span
-                            className={`status-indicator-dot ${isAway ? 'away' : 'online'}`}
-                            title={isAway ? 'Away' : 'Online'}
-                          />
-                          <span
-                            className="user-mic-pill"
-                            title={u.micEnabled ? 'Microphone on' : 'Microphone off'}
-                          >
-                            {u.micEnabled ? '🎙️' : '🔇'}
-                          </span>
-                          {nearbyInfo ? (
-                            <span className="nearby-vol" title="Proximity volume">
-                              {Math.round(volumeFromDistance(nearbyInfo.dist) * 100)}% vol
-                            </span>
-                          ) : !isMe ? (
-                            <span className="nearby-dist" title="Out of earshot">Far</span>
-                          ) : null}
-                        </div>
+              <div className="card-body sidebar-tab-content">
+                {sidebarTab === 'teammates' ? (
+                  <div className="nearby-list" aria-live="polite" aria-label="Connected room participants">
+                    {users.length === 0 ? (
+                      <div className="nearby-empty">
+                        <RadioIcon size={24} className="nearby-empty-icon" />
+                        <p><strong>Offline Preview Mode</strong></p>
+                        <p>Start backend on port 5000 to connect with teammates.</p>
                       </div>
-                    );
-                  })}
-                </div>
+                    ) : users.length === 1 ? (
+                      <div className="nearby-empty">
+                        <UsersIcon size={24} className="nearby-empty-icon" />
+                        <p><strong>You are the only one here</strong></p>
+                        <p>Invite colleagues to join this room or explore another space!</p>
+                      </div>
+                    ) : null}
+
+                    {(users.length > 0 ? users : [{
+                      id: 'local-preview',
+                      name: profile.name || 'You',
+                      avatarColor: profile.avatarColor || '#2563eb',
+                      avatarStyle: profile.avatarStyle || 'classic',
+                      status: profile.status || 'online',
+                      micEnabled: false,
+                    }]).map((u) => {
+                      const isMe = u.id === myId || u.id === 'local-preview';
+                      const nearbyInfo = nearbyUsers.find((n) => n.user.id === u.id);
+                      const statusVal = u.status || 'online';
+                      const initials = (u.name || (isMe ? 'YOU' : 'GU')).slice(0, 2).toUpperCase();
+
+                      return (
+                        <div key={u.id} className="nearby-user-row">
+                          <div
+                            className="nearby-avatar"
+                            style={{ background: u.avatarColor || (isMe ? '#2563eb' : '#06b6d4') }}
+                          >
+                            {initials}
+                          </div>
+                          <span className="nearby-user-name">
+                            {u.name || 'Guest'} {isMe && '(You)'}
+                          </span>
+                          <div className="nearby-meta">
+                            <span
+                              className={`status-indicator-dot ${statusVal}`}
+                              title={`Status: ${statusVal.charAt(0).toUpperCase() + statusVal.slice(1)}`}
+                            />
+                            <span
+                              className="user-mic-pill"
+                              title={u.micEnabled ? 'Microphone on' : 'Microphone muted'}
+                            >
+                              {u.micEnabled ? (
+                                <span style={{ color: 'var(--status-online)' }}><MicIcon size={13} /></span>
+                              ) : (
+                                <span style={{ color: 'var(--text-muted)' }}><MicOffIcon size={13} /></span>
+                              )}
+                            </span>
+                            {nearbyInfo ? (
+                              <span className="nearby-vol" title="Proximity volume">
+                                {Math.round(volumeFromDistance(nearbyInfo.dist) * 100)}%
+                              </span>
+                            ) : !isMe ? (
+                              <span className="nearby-dist" title="Beyond earshot radius">Far</span>
+                            ) : null}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="chat-view-container">
+                    <div className="chat-messages-container" role="log" aria-live="polite">
+                      {roomMessages.length === 0 ? (
+                        <div className="chat-empty-state">
+                          <span className="chat-empty-icon">💬</span>
+                          <p><strong>No messages yet</strong></p>
+                          <p>Messages sent here are isolated to <strong>{roomInfo.title}</strong>.</p>
+                        </div>
+                      ) : (
+                        roomMessages.map((msg) => {
+                          const isMe = msg.senderId === myId;
+                          return (
+                            <div
+                              key={msg.id}
+                              className={`chat-message-bubble ${isMe ? 'is-me' : ''}`}
+                            >
+                              <div className="chat-msg-header">
+                                <span
+                                  className="chat-msg-avatar"
+                                  style={{ background: msg.avatarColor || (isMe ? '#2563eb' : '#06b6d4') }}
+                                >
+                                  {(msg.senderName || 'GU').slice(0, 2).toUpperCase()}
+                                </span>
+                                <span className="chat-msg-name">
+                                  {msg.senderName} {isMe ? '(You)' : ''}
+                                </span>
+                                <span className="chat-msg-time">{msg.timestamp}</span>
+                              </div>
+                              <div className="chat-msg-text">{msg.text}</div>
+                            </div>
+                          );
+                        })
+                      )}
+                      <div ref={chatBottomRef} />
+                    </div>
+
+                    <form className="chat-input-form" onSubmit={handleSendChat}>
+                      <input
+                        type="text"
+                        className="chat-input-field"
+                        placeholder={`Message ${roomInfo.title || 'room'}…`}
+                        value={chatInput}
+                        maxLength={300}
+                        onChange={(e) => setChatInput(e.target.value)}
+                      />
+                      <button
+                        type="submit"
+                        className="chat-send-btn"
+                        disabled={!chatInput.trim()}
+                        title="Send message"
+                      >
+                        Send
+                      </button>
+                    </form>
+                  </div>
+                )}
               </div>
             </div>
           </aside>
@@ -601,32 +994,33 @@ export default function App() {
             <div className="modal-header">
               <h3 id="customizer-title">Customize Avatar & Profile</h3>
               <button
+                type="button"
                 className="modal-close"
                 onClick={() => setShowCustomizer(false)}
                 aria-label="Close modal"
               >
-                ✕
+                <CloseIcon size={16} />
               </button>
             </div>
             <div className="modal-body">
-              {/* Avatar Live Preview */}
+              {/* Avatar Live Interactive Preview */}
               <div className="avatar-preview-container">
                 <div
                   className="avatar-preview-circle"
-                  style={{ background: editProfile.avatarColor || '#259765' }}
+                  style={{ background: editProfile.avatarColor || '#2563eb' }}
                 >
                   {(editProfile.name || 'ME').slice(0, 2).toUpperCase()}
-                  {editProfile.avatarStyle === 'star' && <span className="avatar-preview-badge">⭐</span>}
-                  {editProfile.avatarStyle === 'crown' && <span className="avatar-preview-badge">👑</span>}
-                  {editProfile.avatarStyle === 'diamond' && <span className="avatar-preview-badge">💎</span>}
+                  {editProfile.avatarStyle === 'star' && <span className="avatar-preview-badge"><StarIcon size={12} /></span>}
+                  {editProfile.avatarStyle === 'crown' && <span className="avatar-preview-badge"><CrownIcon size={12} /></span>}
+                  {editProfile.avatarStyle === 'diamond' && <span className="avatar-preview-badge"><DiamondIcon size={12} /></span>}
                   <span
                     className="avatar-preview-status"
-                    style={{ background: editProfile.status === 'away' ? '#f59e0b' : '#10b981' }}
+                    style={{ background: statusColor(editProfile.status) }}
                   />
                 </div>
               </div>
 
-              {/* Display Name */}
+              {/* Display Name Field */}
               <div className="form-field">
                 <label htmlFor="profile-name">Display Name</label>
                 <input
@@ -640,7 +1034,7 @@ export default function App() {
                 />
               </div>
 
-              {/* Color Palette */}
+              {/* 10-Color Curated Palette */}
               <div className="form-field">
                 <label>Avatar Color</label>
                 <div className="color-palette-grid">
@@ -653,15 +1047,15 @@ export default function App() {
                       onClick={() => setEditProfile({ ...editProfile, avatarColor: c })}
                       aria-label={`Select color ${c}`}
                     >
-                      {editProfile.avatarColor === c && '✓'}
+                      {editProfile.avatarColor === c && <CheckIcon size={14} />}
                     </button>
                   ))}
                 </div>
               </div>
 
-              {/* Style Badge */}
+              {/* Badge Style Selection */}
               <div className="form-field">
-                <label>Badge Style</label>
+                <label>Style Badge</label>
                 <div className="style-button-group">
                   {STYLES.map((s) => (
                     <button
@@ -670,29 +1064,42 @@ export default function App() {
                       className={`choice-btn ${editProfile.avatarStyle === s.id ? 'selected' : ''}`}
                       onClick={() => setEditProfile({ ...editProfile, avatarStyle: s.id })}
                     >
-                      <span>{s.icon}</span> {s.label}
+                      <span>{s.icon}</span>
+                      <span>{s.label}</span>
                     </button>
                   ))}
                 </div>
               </div>
 
-              {/* Status */}
+              {/* 3-Tier Availability Status Selection */}
               <div className="form-field">
-                <label>Status</label>
+                <label>Availability Status</label>
                 <div className="status-button-group">
                   <button
                     type="button"
-                    className={`choice-btn ${editProfile.status !== 'away' ? 'selected' : ''}`}
+                    className={`choice-btn ${editProfile.status === 'online' || !editProfile.status ? 'selected' : ''}`}
                     onClick={() => setEditProfile({ ...editProfile, status: 'online' })}
                   >
-                    <span className="status-indicator-dot online" /> Online
+                    <span className="status-indicator-dot online" />
+                    <span>Online</span>
                   </button>
+
+                  <button
+                    type="button"
+                    className={`choice-btn ${editProfile.status === 'busy' ? 'selected' : ''}`}
+                    onClick={() => setEditProfile({ ...editProfile, status: 'busy' })}
+                  >
+                    <span className="status-indicator-dot busy" />
+                    <span>Busy</span>
+                  </button>
+
                   <button
                     type="button"
                     className={`choice-btn ${editProfile.status === 'away' ? 'selected' : ''}`}
                     onClick={() => setEditProfile({ ...editProfile, status: 'away' })}
                   >
-                    <span className="status-indicator-dot away" /> Away
+                    <span className="status-indicator-dot away" />
+                    <span>Away</span>
                   </button>
                 </div>
               </div>
@@ -729,12 +1136,12 @@ export default function App() {
                 onClick={() => setShowCreateModal(false)}
                 aria-label="Close modal"
               >
-                ✕
+                <CloseIcon size={16} />
               </button>
             </div>
             <div className="modal-body">
               <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0 }}>
-                Create a private room isolated from public spaces. An invitation code will be generated for your team.
+                Create a private room isolated from public spaces. A unique invitation code (PRV-XXXX) will be generated for your team.
               </p>
               <div className="form-field">
                 <label htmlFor="meeting-title">Meeting Title</label>
@@ -783,7 +1190,7 @@ export default function App() {
                 onClick={() => setShowJoinModal(false)}
                 aria-label="Close modal"
               >
-                ✕
+                <CloseIcon size={16} />
               </button>
             </div>
             <div className="modal-body">
@@ -826,19 +1233,52 @@ export default function App() {
         </div>
       )}
 
-      {/* ── Footer ──────────────────────────────────────────────────────────── */}
+      {/* 4. Leave Private Meeting Confirmation Modal */}
+      {showLeaveConfirm && (
+        <div className="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="leave-title">
+          <div className="modal-card">
+            <div className="modal-header">
+              <h3 id="leave-title">Leave Private Meeting?</h3>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setShowLeaveConfirm(false)}
+                aria-label="Close modal"
+              >
+                <CloseIcon size={16} />
+              </button>
+            </div>
+            <div className="modal-body">
+              <p style={{ fontSize: 14, color: 'var(--neutral-700)', margin: 0, lineHeight: 1.5 }}>
+                Are you sure you want to leave <strong>{roomInfo.title}</strong>? You will be returned to the General Office.
+              </p>
+              <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>
+                If you are the last participant, this private meeting will be closed automatically.
+              </p>
+            </div>
+            <div className="modal-footer">
+              <button
+                type="button"
+                className="modal-btn-cancel"
+                onClick={() => setShowLeaveConfirm(false)}
+              >
+                Stay in Meeting
+              </button>
+              <button
+                type="button"
+                className="modal-btn-danger"
+                onClick={confirmLeavePrivate}
+              >
+                Leave Meeting
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Footer ──────────────────────────────────────────────────────────── */}
       <footer className="page-footer">
-        ProxiSpeak · Geospatial Proximity Audio Ecosystem ·{' '}
-        <a
-          href="https://github.com"
-          style={{ color: 'inherit', textDecoration: 'underline' }}
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          GitHub
-        </a>
+        ProxiSpeak · Geospatial Proximity Audio Ecosystem · Premium Collaborative Office
       </footer>
     </main>
   );

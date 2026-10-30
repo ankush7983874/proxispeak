@@ -43,6 +43,17 @@ const sessionSchema = new mongoose.Schema(
       required: true,
       maxlength: 40,
     },
+    email: {
+      type: String,
+      default: null,
+      maxlength: 100,
+    },
+    guestId: {
+      type: String,
+      default: null,
+      index: true,
+      maxlength: 60,
+    },
     // Raw canvas coordinates for quick in-memory use
     x: { type: Number, required: true, min: 0, max: CANVAS_WIDTH  },
     y: { type: Number, required: true, min: 0, max: CANVAS_HEIGHT },

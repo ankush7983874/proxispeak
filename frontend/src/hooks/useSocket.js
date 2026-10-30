@@ -31,7 +31,9 @@ export function useSocket() {
       if (saved) {
         const parsed = JSON.parse(saved);
         return {
+          guestId: parsed.guestId || `guest_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
           name: typeof parsed.name === 'string' ? parsed.name : '',
+          email: typeof parsed.email === 'string' ? parsed.email : '',
           avatarColor: parsed.avatarColor || '#259765',
           avatarStyle: parsed.avatarStyle || 'classic',
           status: parsed.status || 'online',
@@ -41,12 +43,21 @@ export function useSocket() {
       // ignore
     }
     return {
+      guestId: `guest_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
       name: '',
+      email: '',
       avatarColor: '#259765',
       avatarStyle: 'classic',
       status: 'online',
     };
   });
+
+  // Room Chat state
+  const [roomMessages, setRoomMessages] = useState([]);
+
+  // Workstation state
+  const [occupiedDesks, setOccupiedDesks] = useState({});
+  const [currentWorkstation, setCurrentWorkstation] = useState(null);
 
   // Keep users in a ref so canvas draw loop always has the latest value
   // without re-creating the draw loop itself.
@@ -60,6 +71,24 @@ export function useSocket() {
   }, []);
 
   useEffect(() => {
+    // Populate initial preview avatar so canvas and floor plan are immediately alive
+    setUsersSync((prev) => {
+      if (prev.length === 0) {
+        return [{
+          id: 'local-preview',
+          name: profile.name || 'You',
+          x: 360,
+          y: 110,
+          micEnabled: false,
+          room: 'general',
+          avatarColor: profile.avatarColor || '#2563eb',
+          avatarStyle: profile.avatarStyle || 'classic',
+          status: profile.status || 'online',
+        }];
+      }
+      return prev;
+    });
+
     socket.connect();
     setConnecting(true);
 
@@ -69,7 +98,7 @@ export function useSocket() {
       setMyId(socket.id);
 
       // If user had a saved profile name or custom color, sync to server
-      if (profile.name || profile.avatarColor !== '#259765' || profile.avatarStyle !== 'classic') {
+      if (profile.name || profile.avatarColor !== '#2563eb' || profile.avatarStyle !== 'classic') {
         socket.emit('update-profile', profile);
       }
     };
@@ -125,6 +154,8 @@ export function useSocket() {
       setRoomInfo(info);
       if (info?.room) {
         setCurrentRoom(info.room);
+        setRoomMessages([]); // Clean room chat on room switch
+        setCurrentWorkstation(null);
       }
     };
 
@@ -136,6 +167,18 @@ export function useSocket() {
 
     const onRoomError = ({ message }) => {
       setRoomError(message || 'Room error occurred');
+    };
+
+    const onRoomChatMessage = (msg) => {
+      if (msg && typeof msg === 'object') {
+        setRoomMessages((prev) => [...prev.slice(-99), msg]);
+      }
+    };
+
+    const onWorkstationOccupancy = (desks) => {
+      if (desks && typeof desks === 'object') {
+        setOccupiedDesks(desks);
+      }
     };
 
     socket.on('connect',              onConnect);
@@ -151,6 +194,8 @@ export function useSocket() {
     socket.on('room-info',            onRoomInfo);
     socket.on('room-counts',          onRoomCounts);
     socket.on('room-error',           onRoomError);
+    socket.on('room-chat-message',    onRoomChatMessage);
+    socket.on('workstation-occupancy',onWorkstationOccupancy);
 
     return () => {
       socket.off('connect',              onConnect);
@@ -166,19 +211,38 @@ export function useSocket() {
       socket.off('room-info',            onRoomInfo);
       socket.off('room-counts',          onRoomCounts);
       socket.off('room-error',           onRoomError);
+      socket.off('room-chat-message',    onRoomChatMessage);
+      socket.off('workstation-occupancy',onWorkstationOccupancy);
       socket.disconnect();
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   /**
    * Emit a throttled move event.
-   * The server enforces clamping; the client just sends deltas.
+   * The server enforces clamping; during offline preview we move locally.
    */
   const emitMove = useCallback((x, y) => {
     if (socket.connected) {
       socket.emit('move', { x, y });
+    } else {
+      setUsersSync((prev) => {
+        if (prev.length === 0) {
+          return [{
+            id: myId || 'local-preview',
+            name: profile?.name || 'You',
+            x,
+            y,
+            micEnabled: false,
+            room: 'general',
+            avatarColor: profile?.avatarColor || '#2563eb',
+            avatarStyle: profile?.avatarStyle || 'classic',
+            status: profile?.status || 'online',
+          }];
+        }
+        return prev.map((u) => ({ ...u, x, y }));
+      });
     }
-  }, []);
+  }, [myId, profile, setUsersSync]);
 
   /**
    * Emit mic status updates to all peers via server broadcast.
@@ -192,12 +256,26 @@ export function useSocket() {
   /**
    * Switch room (public or private by code)
    */
-  const joinRoom = useCallback((room, code) => {
+  const joinRoom = useCallback((room, code, customProfile, callback) => {
     if (socket.connected) {
       setRoomError(null);
-      socket.emit('join-room', { room, code, profile });
+      const activeProfile = customProfile || profile;
+      socket.emit('join-room', { room, code, profile: activeProfile }, (res) => {
+        if (typeof callback === 'function') callback(res);
+      });
+    } else if (typeof callback === 'function') {
+      callback({ success: false, error: 'Socket is not connected to server' });
     }
   }, [profile]);
+
+  /**
+   * Leave the virtual office and return to welcome page
+   */
+  const leaveOffice = useCallback(() => {
+    if (socket.connected) {
+      socket.emit('leave-office');
+    }
+  }, []);
 
   /**
    * Create a private meeting room
@@ -232,8 +310,52 @@ export function useSocket() {
     }
     if (socket.connected) {
       socket.emit('update-profile', merged);
+    } else {
+      setUsersSync((prev) =>
+        prev.map((u) =>
+          u.id === 'local-preview' || u.id === myId
+            ? {
+                ...u,
+                name: merged.name || u.name,
+                avatarColor: merged.avatarColor || u.avatarColor,
+                avatarStyle: merged.avatarStyle || u.avatarStyle,
+                status: merged.status || u.status,
+              }
+            : u
+        )
+      );
     }
-  }, [profile]);
+  }, [profile, myId, setUsersSync]);
+
+  /**
+   * Send in-room text chat message
+   */
+  const sendRoomChat = useCallback((text) => {
+    if (socket.connected && text && text.trim()) {
+      socket.emit('send-room-chat', { text: text.trim() });
+    }
+  }, []);
+
+  /**
+   * Sit at an interactive workstation / desk
+   */
+  const sitAtWorkstation = useCallback((desk) => {
+    if (!desk) return;
+    setCurrentWorkstation(desk);
+    if (socket.connected) {
+      socket.emit('sit-workstation', { deskId: desk.id, deskName: desk.name });
+    }
+  }, []);
+
+  /**
+   * Leave the workstation
+   */
+  const leaveWorkstation = useCallback(() => {
+    setCurrentWorkstation(null);
+    if (socket.connected) {
+      socket.emit('leave-workstation');
+    }
+  }, []);
 
   const clearRoomError = useCallback(() => {
     setRoomError(null);
@@ -251,12 +373,19 @@ export function useSocket() {
     roomCounts,
     roomError,
     profile,
+    roomMessages,
+    occupiedDesks,
+    currentWorkstation,
     emitMove,
     emitMicStatus,
     joinRoom,
+    leaveOffice,
     createPrivateRoom,
     leavePrivateRoom,
     updateProfile,
+    sendRoomChat,
+    sitAtWorkstation,
+    leaveWorkstation,
     clearRoomError,
   };
 }
