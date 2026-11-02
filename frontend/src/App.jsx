@@ -11,10 +11,17 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import './App.css';
 
 import { useSocket }       from './hooks/useSocket.js';
-import { useOfficeCanvas, checkCollision, findNearbyWorkstation } from './hooks/useOfficeCanvas.js';
+import {
+  useOfficeCanvas,
+  checkCollision,
+  findNearbyWorkstation,
+  getCurrentZone,
+} from './hooks/useOfficeCanvas.js';
 import { useWebRTC }       from './hooks/useWebRTC.js';
 import { getNearbyUsers, EARSHOT_RADIUS, volumeFromDistance } from './utils/proximity.js';
 import { WelcomePage }     from './components/WelcomePage.jsx';
+import { PresencePanel }   from './components/PresencePanel.jsx';
+import { OfficeMinimap }   from './components/OfficeMinimap.jsx';
 
 import {
   BuildingIcon,
@@ -80,6 +87,7 @@ export default function App() {
     roomError,
     profile,
     roomMessages,
+    officePresence,
     occupiedDesks,
     currentWorkstation,
     emitMove,
@@ -109,8 +117,21 @@ export default function App() {
   // Office entry gate: Welcome / Login page appears first
   const [hasJoined, setHasJoined] = useState(false);
 
-  // 2D office canvas renderer
-  useOfficeCanvas(canvasRef, usersRef, myId, currentRoom, roomInfo, profile);
+  // Click-to-Navigate Waypoint State
+  const [waypoint, setWaypoint] = useState(null);
+
+  // 2D office canvas renderer with workstation occupancy & waypoint target marker
+  useOfficeCanvas(
+    canvasRef,
+    usersRef,
+    myId,
+    currentRoom,
+    roomInfo,
+    profile,
+    occupiedDesks,
+    currentWorkstation,
+    waypoint
+  );
 
   // Teardown previous audio connections on room changes
   useEffect(() => {
@@ -138,7 +159,7 @@ export default function App() {
 
   // Workstation interaction & In-Room Chat state
   const [nearbyDesk, setNearbyDesk] = useState(null);
-  const [sidebarTab, setSidebarTab] = useState('teammates'); // 'teammates' | 'chat'
+  const [sidebarTab, setSidebarTab] = useState('directory'); // 'directory' | 'teammates' | 'chat'
   const [chatInput, setChatInput]   = useState('');
   const chatBottomRef = useRef(null);
 
@@ -223,12 +244,12 @@ export default function App() {
       let nx = Math.max(20, Math.min(CANVAS_W - 20, me.x + dx));
       let ny = Math.max(20, Math.min(CANVAS_H - 20, me.y + dy));
 
-      // Realistic obstacle collision with wall/desk sliding
-      if (checkCollision(nx, ny, 10, currentRoom)) {
-        if (!checkCollision(nx, me.y, 10, currentRoom)) {
+      // Realistic obstacle collision with wall/desk sliding for active room
+      if (checkCollision(nx, ny, 10, currentRoom, roomInfo?.isPrivate)) {
+        if (!checkCollision(nx, me.y, 10, currentRoom, roomInfo?.isPrivate)) {
           // Slide along X axis
           ny = me.y;
-        } else if (!checkCollision(me.x, ny, 10, currentRoom)) {
+        } else if (!checkCollision(me.x, ny, 10, currentRoom, roomInfo?.isPrivate)) {
           // Slide along Y axis
           nx = me.x;
         } else {
@@ -247,7 +268,7 @@ export default function App() {
 
       emitMove(nx, ny);
     },
-    [myId, usersRef, currentRoom, currentWorkstation, leaveWorkstation, emitMove]
+    [myId, usersRef, currentRoom, roomInfo?.isPrivate, currentWorkstation, leaveWorkstation, emitMove]
   );
 
   // Keyboard navigation & Workstation interaction (WASD + E)
@@ -261,6 +282,8 @@ export default function App() {
         if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) {
           e.preventDefault();
         }
+        // Manual keyboard input cancels any automated waypoint walking
+        setWaypoint(null);
       }
       if (e.key === 'ArrowUp'    || e.key === 'w') move(0, -STEP);
       if (e.key === 'ArrowDown'  || e.key === 's') move(0,  STEP);
@@ -282,6 +305,77 @@ export default function App() {
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [move, hasJoined, currentWorkstation, nearbyDesk, occupiedDesks, myId, sitAtWorkstation, leaveWorkstation]);
+
+  // Click-to-Navigate Waypoint Ticker
+  useEffect(() => {
+    if (!waypoint || !hasJoined) return;
+    let stuckCounter = 0;
+    let lastPos = null;
+
+    const interval = setInterval(() => {
+      const activeMe = usersRef.current.find((u) => u.id === myId) || usersRef.current[0];
+      if (!activeMe) return;
+
+      const dx = waypoint.x - activeMe.x;
+      const dy = waypoint.y - activeMe.y;
+      const dist = Math.hypot(dx, dy);
+
+      // Reached destination threshold
+      if (dist <= 12) {
+        setWaypoint(null);
+        return;
+      }
+
+      // Check if stuck against obstacle
+      if (lastPos && lastPos.x === activeMe.x && lastPos.y === activeMe.y) {
+        stuckCounter++;
+        if (stuckCounter >= 5) {
+          setWaypoint(null);
+          return;
+        }
+      } else {
+        stuckCounter = 0;
+        lastPos = { x: activeMe.x, y: activeMe.y };
+      }
+
+      const stepDist = Math.min(STEP, dist);
+      const stepX = Math.round((dx / dist) * stepDist);
+      const stepY = Math.round((dy / dist) * stepDist);
+
+      move(stepX, stepY);
+    }, MOVE_THROTTLE_MS);
+
+    return () => clearInterval(interval);
+  }, [waypoint, hasJoined, myId, usersRef, move]);
+
+  // Canvas Click Handler (Click-to-Navigate)
+  const handleCanvasClick = (e) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = CANVAS_W / rect.width;
+    const scaleY = CANVAS_H / rect.height;
+    const clickX = Math.round((e.clientX - rect.left) * scaleX);
+    const clickY = Math.round((e.clientY - rect.top) * scaleY);
+
+    const targetX = Math.max(20, Math.min(CANVAS_W - 20, clickX));
+    const targetY = Math.max(20, Math.min(CANVAS_H - 20, clickY));
+
+    // Do not set waypoint inside solid obstacle
+    if (checkCollision(targetX, targetY, 10, currentRoom, roomInfo?.isPrivate)) {
+      return;
+    }
+
+    setWaypoint({ x: targetX, y: targetY });
+  };
+
+  // Minimap Navigation Handler
+  const handleMinimapNavigate = (targetX, targetY) => {
+    if (checkCollision(targetX, targetY, 10, currentRoom, roomInfo?.isPrivate)) {
+      return;
+    }
+    setWaypoint({ x: targetX, y: targetY });
+  };
 
   // Track nearest workstation within interaction radius
   useEffect(() => {
@@ -391,6 +485,9 @@ export default function App() {
     return '#10b981';
   };
 
+  const activeMe = users.find((u) => u.id === myId) || users[0];
+  const currentZone = activeMe ? getCurrentZone(activeMe.x, activeMe.y, currentRoom, roomInfo) : null;
+
   // ── Render ────────────────────────────────────────────────────────────────
   if (!hasJoined) {
     return (
@@ -439,6 +536,17 @@ export default function App() {
             <span className={dotClass} />
             <span>{connectionLabel}</span>
           </div>
+
+          <button
+            type="button"
+            className={`topbar-presence-badge ${sidebarTab === 'directory' ? 'active' : ''}`}
+            onClick={() => setSidebarTab('directory')}
+            title="View Live Employee Presence Directory"
+            aria-label={`${officePresence.length} colleagues online`}
+          >
+            <span className="presence-pulse-dot" />
+            <span>{officePresence.length || 1} Online</span>
+          </button>
 
           <button
             type="button"
@@ -646,14 +754,28 @@ export default function App() {
                   <BuildingIcon size={16} />
                   <span>{roomInfo.title || 'Virtual Office Floor'}</span>
                 </h2>
-                <p>Live collaborative workspace · Space: {roomInfo.room || currentRoom}</p>
+                <div className="card-header-subline">
+                  <p>Live collaborative workspace · Space: {roomInfo.room || currentRoom}</p>
+                  {currentZone && (
+                    <span className="active-zone-badge" title="Current Office Zone">
+                      {currentZone.icon} {currentZone.name}
+                    </span>
+                  )}
+                </div>
               </div>
-              {connected && (
-                <span className="live-label">
-                  <span />
-                  LIVE
-                </span>
-              )}
+              <div className="card-header-actions">
+                {waypoint && (
+                  <span className="navigating-badge" title="Walking to destination">
+                    <span className="nav-pulsing-dot" /> Walking to ({waypoint.x}, {waypoint.y})
+                  </span>
+                )}
+                {connected && (
+                  <span className="live-label">
+                    <span />
+                    LIVE
+                  </span>
+                )}
+              </div>
             </div>
 
             <div className="canvas-wrap">
@@ -665,9 +787,21 @@ export default function App() {
                   </span>
                 </div>
               )}
+
+              {/* Minimap Navigation Overview */}
+              <OfficeMinimap
+                myId={myId}
+                users={users}
+                currentRoom={currentRoom}
+                roomInfo={roomInfo}
+                currentZone={currentZone}
+                onNavigate={handleMinimapNavigate}
+              />
+
               <canvas
                 ref={canvasRef}
-                aria-label="Interactive 2D virtual office map showing participant avatars"
+                onClick={handleCanvasClick}
+                aria-label="Interactive 2D virtual office map showing participant avatars. Click anywhere to navigate your avatar."
                 style={{ cursor: 'crosshair' }}
               />
             </div>
@@ -825,18 +959,31 @@ export default function App() {
               </div>
             </div>
 
-            {/* Tabbed Teammates & Room Chat Card */}
+            {/* Tabbed Presence Directory, Teammates & Room Chat Card */}
             <div className="card tabbed-sidebar-card">
               <div className="sidebar-tab-bar" role="tablist" aria-label="Sidebar navigation">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={sidebarTab === 'directory'}
+                  className={`sidebar-tab-btn ${sidebarTab === 'directory' ? 'active' : ''}`}
+                  onClick={() => setSidebarTab('directory')}
+                  title="Live Employee Presence Panel across all rooms"
+                >
+                  <UsersIcon size={14} />
+                  <span>Directory</span>
+                  <span className="tab-counter-badge">{officePresence.length}</span>
+                </button>
                 <button
                   type="button"
                   role="tab"
                   aria-selected={sidebarTab === 'teammates'}
                   className={`sidebar-tab-btn ${sidebarTab === 'teammates' ? 'active' : ''}`}
                   onClick={() => setSidebarTab('teammates')}
+                  title="Participants in your current room"
                 >
-                  <UsersIcon size={14} />
-                  <span>Teammates</span>
+                  <BuildingIcon size={14} />
+                  <span>In Room</span>
                   <span className="tab-counter-badge">{users.length}</span>
                 </button>
                 <button
@@ -845,9 +992,10 @@ export default function App() {
                   aria-selected={sidebarTab === 'chat'}
                   className={`sidebar-tab-btn ${sidebarTab === 'chat' ? 'active' : ''}`}
                   onClick={() => setSidebarTab('chat')}
+                  title="In-Room Text Chat"
                 >
                   <span>💬</span>
-                  <span>In-Room Chat</span>
+                  <span>Chat</span>
                   {roomMessages.length > 0 && (
                     <span className="tab-counter-badge">{roomMessages.length}</span>
                   )}
@@ -855,7 +1003,15 @@ export default function App() {
               </div>
 
               <div className="card-body sidebar-tab-content">
-                {sidebarTab === 'teammates' ? (
+                {sidebarTab === 'directory' ? (
+                  <PresencePanel
+                    presenceList={officePresence}
+                    myId={myId}
+                    currentRoom={currentRoom}
+                    nearbyUsers={nearbyUsers}
+                    onJoinRoom={(targetRoom) => joinRoom(targetRoom)}
+                  />
+                ) : sidebarTab === 'teammates' ? (
                   <div className="nearby-list" aria-live="polite" aria-label="Connected room participants">
                     {users.length === 0 ? (
                       <div className="nearby-empty">

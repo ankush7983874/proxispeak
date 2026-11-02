@@ -129,6 +129,40 @@ function getRoomCounts() {
   return counts;
 }
 
+// ── Utility: office presence list ──────────────────────────────────────────
+export function getOfficePresence() {
+  const presence = [];
+  for (const [, u] of users) {
+    let roomTitle = 'General Office';
+    if (u.room === 'meeting')      roomTitle = 'Meeting Room';
+    else if (u.room === 'focus')   roomTitle = 'Focus Room';
+    else if (u.room && privateRooms.has(u.room)) {
+      roomTitle = privateRooms.get(u.room).title || 'Private Meeting';
+    } else if (!u.room) {
+      roomTitle = 'Lobby';
+    }
+
+    presence.push({
+      id: u.id,
+      name: u.name,
+      email: u.email || null,
+      guestId: u.guestId || null,
+      room: u.room || 'general',
+      roomTitle,
+      isPrivate: Boolean(u.room && privateRooms.has(u.room)),
+      status: u.status || 'online',
+      micEnabled: Boolean(u.micEnabled),
+      avatarColor: u.avatarColor || '#259765',
+      avatarStyle: u.avatarStyle || 'classic',
+      workstation: u.workstation || null,
+      joinedAt: u.joinedAt || null,
+      x: u.x,
+      y: u.y,
+    });
+  }
+  return presence;
+}
+
 // ── Utility: generate random private room code ───────────────────────────────
 function generateRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // exclude ambiguous 0/O, 1/I
@@ -173,6 +207,15 @@ app.get('/api/health', (_req, res) => {
     rooms: getRoomCounts(),
     activePrivateRooms: privateRooms.size,
     database: getDBStatus(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get('/api/presence', (_req, res) => {
+  res.json({
+    success: true,
+    count: users.size,
+    presence: getOfficePresence(),
     timestamp: new Date().toISOString(),
   });
 });
@@ -257,6 +300,7 @@ io.on('connection', async (socket) => {
     avatarColor: '#259765',
     avatarStyle: 'classic',
     status: 'online',
+    joinedAt: new Date().toISOString(),
   };
   users.set(socket.id, user);
 
@@ -295,6 +339,7 @@ io.on('connection', async (socket) => {
   // Broadcast presence & updated global room counts
   socket.to('general').emit('user-joined', user);
   io.emit('room-counts', getRoomCounts());
+  io.emit('presence-list', getOfficePresence());
 
   log('log', `[CONNECT] ${name} (${socket.id}) joined general — ${users.size} total`);
 
@@ -412,6 +457,7 @@ io.on('connection', async (socket) => {
           avatarStyle: user.avatarStyle,
           status: user.status,
         });
+        io.emit('presence-list', getOfficePresence());
       }
       const currentRoomUsers = Array.from(users.values()).filter((u) => u.room === roomToJoin);
       socket.emit('initial-users', currentRoomUsers);
@@ -474,6 +520,7 @@ io.on('connection', async (socket) => {
 
     // Update room counts across all clients
     io.emit('room-counts', getRoomCounts());
+    io.emit('presence-list', getOfficePresence());
 
     log('log', `[ROOM-JOIN] ${user.name} moved from ${oldRoom} to ${roomToJoin}`);
 
@@ -526,6 +573,7 @@ io.on('connection', async (socket) => {
     socket.emit('initial-users', [user]);
 
     io.emit('room-counts', getRoomCounts());
+    io.emit('presence-list', getOfficePresence());
     log('log', `[PRIVATE-ROOM] Created ${code} ("${cleanTitle}") by ${user.name}`);
 
     if (db.connected) {
@@ -567,6 +615,7 @@ io.on('connection', async (socket) => {
 
     socket.to('general').emit('user-joined', user);
     io.emit('room-counts', getRoomCounts());
+    io.emit('presence-list', getOfficePresence());
 
     log('log', `[ROOM-LEAVE] ${user.name} left ${oldRoom} returned to general`);
   });
@@ -587,6 +636,7 @@ io.on('connection', async (socket) => {
 
     user.room = null;
     io.emit('room-counts', getRoomCounts());
+    io.emit('presence-list', getOfficePresence());
     log('log', `[LEAVE-OFFICE] ${user.name} (${socket.id}) exited to welcome screen`);
 
     if (db.connected) {
@@ -633,6 +683,7 @@ io.on('connection', async (socket) => {
       deskName: deskName || deskId,
     });
     io.emit('workstation-occupancy', Object.fromEntries(occupiedWorkstations));
+    io.emit('presence-list', getOfficePresence());
     log('log', `[WORKSTATION] ${user.name} occupied ${deskId}`);
   });
 
@@ -641,6 +692,7 @@ io.on('connection', async (socket) => {
       occupiedWorkstations.delete(user.workstation);
       user.workstation = null;
       io.emit('workstation-occupancy', Object.fromEntries(occupiedWorkstations));
+      io.emit('presence-list', getOfficePresence());
       log('log', `[WORKSTATION] ${user.name} left workstation`);
     }
   });
@@ -683,6 +735,7 @@ io.on('connection', async (socket) => {
         avatarStyle: user.avatarStyle,
         status: user.status,
       });
+      io.emit('presence-list', getOfficePresence());
 
       if (db.connected) {
         Session.updateOne(
@@ -708,6 +761,7 @@ io.on('connection', async (socket) => {
     user.micEnabled = data.micEnabled;
     // Broadcast mic state ONLY to users in the same room
     socket.to(user.room).emit('user-mic-status', { id: socket.id, micEnabled: data.micEnabled });
+    io.emit('presence-list', getOfficePresence());
 
     if (db.connected) {
       Session.updateOne(
@@ -763,6 +817,7 @@ io.on('connection', async (socket) => {
 
     // Broadcast updated room counts to all remaining clients
     io.emit('room-counts', getRoomCounts());
+    io.emit('presence-list', getOfficePresence());
 
     if (db.connected) {
       Session.deleteOne({ socketId: socket.id })

@@ -55,6 +55,9 @@ export function useSocket() {
   // Room Chat state
   const [roomMessages, setRoomMessages] = useState([]);
 
+  // Live Office Presence state across all office rooms
+  const [officePresence, setOfficePresence] = useState([]);
+
   // Workstation state
   const [occupiedDesks, setOccupiedDesks] = useState({});
   const [currentWorkstation, setCurrentWorkstation] = useState(null);
@@ -181,6 +184,12 @@ export function useSocket() {
       }
     };
 
+    const onPresenceList = (list) => {
+      if (Array.isArray(list)) {
+        setOfficePresence(list);
+      }
+    };
+
     socket.on('connect',              onConnect);
     socket.on('disconnect',           onDisconnect);
     socket.on('connect_error',        onConnectError);
@@ -196,6 +205,7 @@ export function useSocket() {
     socket.on('room-error',           onRoomError);
     socket.on('room-chat-message',    onRoomChatMessage);
     socket.on('workstation-occupancy',onWorkstationOccupancy);
+    socket.on('presence-list',        onPresenceList);
 
     return () => {
       socket.off('connect',              onConnect);
@@ -213,6 +223,7 @@ export function useSocket() {
       socket.off('room-error',           onRoomError);
       socket.off('room-chat-message',    onRoomChatMessage);
       socket.off('workstation-occupancy',onWorkstationOccupancy);
+      socket.off('presence-list',        onPresenceList);
       socket.disconnect();
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -374,6 +385,7 @@ export function useSocket() {
     roomError,
     profile,
     roomMessages,
+    officePresence,
     occupiedDesks,
     currentWorkstation,
     emitMove,

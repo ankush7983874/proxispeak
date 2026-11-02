@@ -15,7 +15,12 @@ import { getNearbyUsers as getNearbyClient } from '../frontend/src/utils/proximi
 import {
   checkCollision,
   findNearbyWorkstation,
+  getRoomObstacles,
+  getCurrentZone,
   GENERAL_OBSTACLES,
+  MEETING_OBSTACLES,
+  FOCUS_OBSTACLES,
+  PRIVATE_OBSTACLES,
   GENERAL_WORKSTATIONS,
 } from '../frontend/src/hooks/useOfficeCanvas.js';
 
@@ -371,6 +376,143 @@ const chatXSS = sanitizeAndDispatchChat({
 assert(chatXSS && chatXSS.text === 'Important announcement', 'Strips HTML/XSS injection tags from chat message');
 assert(sanitizeAndDispatchChat({ text: '   ' }) === null, 'Rejects empty or whitespace-only chat message');
 assert(sanitizeAndDispatchChat({ text: null }) === null, 'Rejects null chat text');
+
+// ── 13. Live Office Presence Serialization & Directory Contract ─────────────
+function buildTestOfficePresence(usersMap, privateRoomsMap) {
+  const presence = [];
+  for (const [, u] of usersMap) {
+    let roomTitle = 'General Office';
+    if (u.room === 'meeting')      roomTitle = 'Meeting Room';
+    else if (u.room === 'focus')   roomTitle = 'Focus Room';
+    else if (u.room && privateRoomsMap.has(u.room)) {
+      roomTitle = privateRoomsMap.get(u.room).title || 'Private Meeting';
+    } else if (!u.room) {
+      roomTitle = 'Lobby';
+    }
+
+    presence.push({
+      id: u.id,
+      name: u.name,
+      email: u.email || null,
+      guestId: u.guestId || null,
+      room: u.room || 'general',
+      roomTitle,
+      isPrivate: Boolean(u.room && privateRoomsMap.has(u.room)),
+      status: u.status || 'online',
+      micEnabled: Boolean(u.micEnabled),
+      avatarColor: u.avatarColor || '#259765',
+      avatarStyle: u.avatarStyle || 'classic',
+      workstation: u.workstation || null,
+      joinedAt: u.joinedAt || null,
+      x: u.x,
+      y: u.y,
+    });
+  }
+  return presence;
+}
+
+const mockPresenceUsers = new Map([
+  ['sock-1', { id: 'sock-1', name: 'Alice Chen', email: 'alice@company.com', guestId: 'EMP-01', room: 'general', status: 'online', micEnabled: true, avatarColor: '#2563eb', avatarStyle: 'crown', workstation: 'Workstation 1', x: 60, y: 125 }],
+  ['sock-2', { id: 'sock-2', name: 'Bob Smith', email: 'bob@company.com', guestId: 'EMP-02', room: 'meeting', status: 'busy', micEnabled: false, avatarColor: '#06b6d4', avatarStyle: 'star', workstation: null, x: 300, y: 100 }],
+  ['sock-3', { id: 'sock-3', name: 'Elena Rostova', email: 'elena@company.com', guestId: 'EMP-03', room: 'PRV-DEMO', status: 'away', micEnabled: false, avatarColor: '#8b5cf6', avatarStyle: 'diamond', workstation: null, x: 200, y: 200 }],
+  ['sock-4', { id: 'sock-4', name: 'David Guest', email: null, guestId: null, room: null, status: 'online', micEnabled: false, avatarColor: '#10b981', avatarStyle: 'classic', workstation: null, x: 400, y: 250 }],
+]);
+
+const mockPresencePrivateRooms = new Map([
+  ['PRV-DEMO', { code: 'PRV-DEMO', title: 'Executive Sync', hostSocketId: 'sock-3' }],
+]);
+
+const presenceList = buildTestOfficePresence(mockPresenceUsers, mockPresencePrivateRooms);
+
+assert(presenceList.length === 4, 'Presence list reflects exactly 4 connected participants');
+const alicePresence = presenceList.find(p => p.id === 'sock-1');
+assert(alicePresence && alicePresence.roomTitle === 'General Office', 'Alice mapped to General Office');
+assert(alicePresence.workstation === 'Workstation 1', 'Alice workstation metadata preserved');
+assert(alicePresence.micEnabled === true, 'Alice mic status true');
+
+const bobPresence = presenceList.find(p => p.id === 'sock-2');
+assert(bobPresence && bobPresence.roomTitle === 'Meeting Room', 'Bob mapped to Meeting Room');
+assert(bobPresence.isPrivate === false, 'Meeting Room is not private');
+
+const elenaPresence = presenceList.find(p => p.id === 'sock-3');
+assert(elenaPresence && elenaPresence.roomTitle === 'Executive Sync', 'Elena private room title resolved');
+assert(elenaPresence.isPrivate === true, 'Elena is marked as isPrivate: true');
+
+const guestPresence = presenceList.find(p => p.id === 'sock-4');
+assert(guestPresence && guestPresence.roomTitle === 'Lobby', 'User with null room mapped to Lobby');
+
+// ── 14. Multi-Room Furniture Obstacle Collisions & Sliding ──────────────────
+assert(getRoomObstacles('general').length >= 10, 'General office has at least 10 furniture obstacle bounds');
+assert(getRoomObstacles('meeting').length >= 4, 'Meeting room defines at least 4 obstacle bounds (video wall, podium, table, lounges)');
+assert(getRoomObstacles('focus').length >= 4, 'Focus room defines 4 private acoustic pods');
+assert(getRoomObstacles('PRV-TEST', true).length >= 3, 'Private room defines boardroom and presentation obstacles');
+
+// Collision in Meeting Room: Grand Boardroom Table at { x: 200, y: 160, w: 400, h: 110 }
+assert(checkCollision(300, 200, 10, 'meeting'), 'Collides with Grand Boardroom Table in meeting room at (300, 200)');
+assert(!checkCollision(100, 300, 10, 'meeting'), 'Free walking aisle in meeting room at (100, 300) does not collide');
+
+// Collision in Focus Room: Pod 1 at { x: 65, y: 85, w: 190, h: 45 }
+assert(checkCollision(100, 100, 10, 'focus'), 'Collides with Silent Pod A desk in focus room at (100, 100)');
+assert(!checkCollision(350, 250, 10, 'focus'), 'Center corridor in focus room at (350, 250) does not collide');
+
+// Collision in Private Room: Executive Table at { x: 170, y: 120, w: 460, h: 130 }
+assert(checkCollision(300, 180, 10, 'PRV-DEMO', true), 'Collides with Executive Boardroom Table in private room');
+assert(!checkCollision(100, 300, 10, 'PRV-DEMO', true), 'Free space in private room does not collide');
+
+// Meeting room axis sliding simulation
+const meetingSlide = simulateMoveWithSliding(200, 140, 10, 15, 'meeting');
+assert(meetingSlide.moved, 'Avatar performs axis sliding around boardroom table in meeting room');
+
+// ── 15. Interactive Minimap Coordinate Conversion & Zone Mapping ─────────────
+// Minimap is 184 x 115 px representing 800 x 500 px canvas (ratio 16:10)
+function convertMinimapToCanvas(clickX, clickY, mapW = 184, mapH = 115, canvasW = 800, canvasH = 500) {
+  const rawX = Math.round((clickX / mapW) * canvasW);
+  const rawY = Math.round((clickY / mapH) * canvasH);
+  return {
+    x: Math.max(20, Math.min(canvasW - 20, rawX)),
+    y: Math.max(20, Math.min(canvasH - 20, rawY)),
+  };
+}
+
+const centerNav = convertMinimapToCanvas(92, 57.5);
+assert(centerNav.x === 400 && centerNav.y === 250, 'Minimap center (92, 57.5) scales to canvas center (400, 250)');
+
+const topLeftNav = convertMinimapToCanvas(0, 0);
+assert(topLeftNav.x === 20 && topLeftNav.y === 20, 'Minimap (0, 0) clamped safely within canvas border bounds');
+
+const bottomRightNav = convertMinimapToCanvas(184, 115);
+assert(bottomRightNav.x === 780 && bottomRightNav.y === 480, 'Minimap (184, 115) clamped safely within canvas border bounds');
+
+// Zone identification test across various coordinates
+const devZone = getCurrentZone(100, 100, 'general');
+assert(devZone && devZone.name === 'DEV & ENGINEERING', 'Zone at (100, 100) identified as DEV & ENGINEERING');
+
+const collabZone = getCurrentZone(350, 100, 'general');
+assert(collabZone && collabZone.name === 'COLLABORATION HUB', 'Zone at (350, 100) identified as COLLABORATION HUB');
+
+const confZone = getCurrentZone(600, 100, 'general');
+assert(confZone && confZone.name === 'GLASS CONFERENCE', 'Zone at (600, 100) identified as GLASS CONFERENCE');
+
+const receptionZone = getCurrentZone(50, 400, 'general');
+assert(receptionZone && receptionZone.name === 'RECEPTION', 'Zone at (50, 400) identified as RECEPTION');
+
+const cafeZone = getCurrentZone(250, 400, 'general');
+assert(cafeZone && cafeZone.name === 'REFRESHMENT CAFE', 'Zone at (250, 400) identified as REFRESHMENT CAFE');
+
+const loungeZone = getCurrentZone(500, 400, 'general');
+assert(loungeZone && loungeZone.name === 'BREAKOUT LOUNGE', 'Zone at (500, 400) identified as BREAKOUT LOUNGE');
+
+const corridorZone = getCurrentZone(300, 300, 'general');
+assert(corridorZone && corridorZone.name === 'Office Corridor', 'Unzoned canvas point identified as Office Corridor walkway');
+
+const meetingStage = getCurrentZone(100, 100, 'meeting');
+assert(meetingStage && meetingStage.name === 'BOARDROOM & STAGE', 'Meeting room identified as BOARDROOM & STAGE');
+
+const focusPodA = getCurrentZone(100, 100, 'focus');
+assert(focusPodA && focusPodA.name === 'SILENT POD A', 'Focus room identified as SILENT POD A');
+
+const privateZone = getCurrentZone(100, 100, 'PRV-1234', { isPrivate: true, title: 'Investor Pitch' });
+assert(privateZone && privateZone.name === 'INVESTOR PITCH', 'Private room identified with custom uppercase title');
 
 console.log(`\n── Results: ${pass} passed, ${fail} failed ──\n`);
 process.exit(fail > 0 ? 1 : 0);

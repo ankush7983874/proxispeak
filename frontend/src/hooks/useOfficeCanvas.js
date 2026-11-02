@@ -36,9 +36,9 @@ function getAvatarColor(id) {
 export const GENERAL_OBSTACLES = [
   // Reception Desk
   { x: 35, y: 395, w: 95, h: 45 },
-  // Workstation Cluster 1 (Top Left)
+  // Workstation Cluster 1 (Top Left, Dev Pods)
   { x: 35, y: 65, w: 200, h: 50 },
-  // Workstation Cluster 2 (Mid Left)
+  // Workstation Cluster 2 (Mid Left, Design Pods)
   { x: 35, y: 195, w: 200, h: 50 },
   // Collaboration Table (Center)
   { x: 355, y: 85, w: 70, h: 50 },
@@ -51,9 +51,39 @@ export const GENERAL_OBSTACLES = [
   { x: 360, y: 235, w: 55, h: 65 },
   { x: 430, y: 235, w: 55, h: 65 },
   // Coffee Bar Counter (Bottom Center)
-  { x: 220, y: 385, w: 150, h: 45 },
+  { x: 210, y: 385, w: 150, h: 45 },
   // Breakout Lounge Sectional (Bottom Right)
   { x: 460, y: 380, w: 140, h: 50 },
+];
+
+export const MEETING_OBSTACLES = [
+  // Main Stage Video Wall
+  { x: 220, y: 25, w: 360, h: 25 },
+  // Presentation Podium
+  { x: 370, y: 60, w: 60, h: 24 },
+  // Grand Boardroom Table
+  { x: 200, y: 160, w: 400, h: 110 },
+  // Discussion Lounges
+  { x: 160, y: 390, w: 140, h: 50 },
+  { x: 500, y: 390, w: 140, h: 50 },
+];
+
+export const FOCUS_OBSTACLES = [
+  // 4 Private Acoustic Deep-Work Pod Desks
+  { x: 65,  y: 85,  w: 190, h: 45 }, // Pod 01
+  { x: 455, y: 85,  w: 190, h: 45 }, // Pod 02
+  { x: 65,  y: 305, w: 190, h: 45 }, // Pod 03
+  { x: 455, y: 305, w: 190, h: 45 }, // Pod 04
+];
+
+export const PRIVATE_OBSTACLES = [
+  // Executive Boardroom Table
+  { x: 170, y: 120, w: 460, h: 130 },
+  // Presentation Video Wall
+  { x: 240, y: 25, w: 320, h: 20 },
+  // Executive Lounges
+  { x: 150, y: 380, w: 160, h: 54 },
+  { x: 490, y: 380, w: 160, h: 54 },
 ];
 
 // Interactive Workstations in General Office
@@ -69,11 +99,23 @@ export const GENERAL_WORKSTATIONS = [
 ];
 
 /**
- * Checks if a given coordinate collides with any solid office furniture
+ * Returns obstacle array for the current room
  */
-export function checkCollision(x, y, radius = 10, currentRoom = 'general') {
-  if (currentRoom !== 'general') return false;
-  return GENERAL_OBSTACLES.some((obs) => {
+export function getRoomObstacles(currentRoom = 'general', isPrivate = false) {
+  if (isPrivate || (typeof currentRoom === 'string' && currentRoom.startsWith('PRV-'))) {
+    return PRIVATE_OBSTACLES;
+  }
+  if (currentRoom === 'meeting') return MEETING_OBSTACLES;
+  if (currentRoom === 'focus')   return FOCUS_OBSTACLES;
+  return GENERAL_OBSTACLES;
+}
+
+/**
+ * Checks if a given coordinate collides with any solid office furniture in the active room
+ */
+export function checkCollision(x, y, radius = 10, currentRoom = 'general', isPrivate = false) {
+  const obstacles = getRoomObstacles(currentRoom, isPrivate);
+  return obstacles.some((obs) => {
     return (
       x + radius > obs.x &&
       x - radius < obs.x + obs.w &&
@@ -92,6 +134,19 @@ export function findNearbyWorkstation(x, y, threshold = 35) {
     if (d <= threshold) return ws;
   }
   return null;
+}
+
+/**
+ * Helper to determine which zone a coordinate falls into
+ */
+export function getCurrentZone(x, y, currentRoom = 'general', roomInfo = {}) {
+  const zones = getRoomZones(currentRoom, roomInfo);
+  for (const z of zones) {
+    if (x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h) {
+      return z;
+    }
+  }
+  return { name: 'Office Corridor', category: 'WALKWAY', icon: '🚶', color: '#f8fafc' };
 }
 
 // ── Helper: Draw a Rounded Rectangle Path ───────────────────────────────────
@@ -652,7 +707,7 @@ function drawPrivateRoomPlan(ctx, _roomTitle = 'Private Meeting') {
 }
 
 // ── Room Zones Architecture Metadata ─────────────────────────────────────────
-const GENERAL_ZONES = [
+export const GENERAL_ZONES = [
   { x: 20,  y: 20,  w: 245, h: 300, name: 'DEV & ENGINEERING', category: 'WORKSTATIONS', color: '#f8fafc', border: '#e2e8f0', badgeBg: '#2563eb', icon: '💻' },
   { x: 285, y: 20,  w: 215, h: 180, name: 'COLLABORATION HUB', category: 'TEAM SYNC',    color: '#eff6ff', border: '#93c5fd', badgeBg: '#0284c7', icon: '💡' },
   { x: 515, y: 20,  w: 265, h: 185, name: 'GLASS CONFERENCE',  category: 'MEETING SUITE',color: '#f0fdfa', border: '#5eead4', badgeBg: '#0f766e', icon: '📊' },
@@ -661,19 +716,19 @@ const GENERAL_ZONES = [
   { x: 440, y: 340, w: 340, h: 140, name: 'BREAKOUT LOUNGE',   category: 'SOCIAL',       color: '#faf5ff', border: '#e9d5ff', badgeBg: '#7e22ce', icon: '🛋️' },
 ];
 
-const MEETING_ZONES = [
+export const MEETING_ZONES = [
   { x: 20,  y: 20,  w: 760, h: 320, name: 'BOARDROOM & STAGE', category: 'CONFERENCE', color: '#eff6ff', border: '#93c5fd', badgeBg: '#1d4ed8', icon: '👥' },
   { x: 20,  y: 360, w: 760, h: 120, name: 'DISCUSSION LOUNGE',category: 'HUDDLE',     color: '#f0f9ff', border: '#bae6fd', badgeBg: '#0284c7', icon: '💬' },
 ];
 
-const FOCUS_ZONES = [
+export const FOCUS_ZONES = [
   { x: 20,  y: 20,  w: 370, h: 220, name: 'SILENT POD A', category: 'DEEP WORK', color: '#f0fdfa', border: '#99f6e4', badgeBg: '#0f766e', icon: '🎧' },
   { x: 410, y: 20,  w: 370, h: 220, name: 'SILENT POD B', category: 'DEEP WORK', color: '#f0fdfa', border: '#99f6e4', badgeBg: '#0f766e', icon: '🎧' },
   { x: 20,  y: 255, w: 370, h: 225, name: 'STUDY POD C',  category: 'READING',   color: '#f8fafc', border: '#cbd5e1', badgeBg: '#475569', icon: '📚' },
   { x: 410, y: 255, w: 370, h: 225, name: 'STUDY POD D',  category: 'RESEARCH',  color: '#f8fafc', border: '#cbd5e1', badgeBg: '#475569', icon: '🔬' },
 ];
 
-function getRoomZones(currentRoom, roomInfo) {
+export function getRoomZones(currentRoom, roomInfo) {
   if (roomInfo?.isPrivate) {
     const title = (roomInfo.title || 'Private Meeting').toUpperCase();
     return [
@@ -697,7 +752,8 @@ export function useOfficeCanvas(
   roomInfo = {},
   profile = null,
   occupiedDesks = {},
-  currentWorkstation = null
+  currentWorkstation = null,
+  waypoint = null
 ) {
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -853,6 +909,42 @@ export function useOfficeCanvas(
         }
       }
 
+      // ── 5b. Interactive Navigation Waypoint Marker ─────────────
+      if (waypoint) {
+        const wx = Math.max(20, Math.min(LOGICAL_W - 20, waypoint.x));
+        const wy = Math.max(20, Math.min(LOGICAL_H - 20, waypoint.y));
+        const pulseR = 12 + Math.sin(pulseAngle * 2) * 3;
+
+        ctx.save();
+        // Path dash line from player to waypoint
+        if (me) {
+          ctx.beginPath();
+          ctx.moveTo(me.x, me.y);
+          ctx.lineTo(wx, wy);
+          ctx.strokeStyle = 'rgba(6, 182, 212, 0.35)';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([4, 4]);
+          ctx.stroke();
+        }
+
+        // Target outer ring
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.arc(wx, wy, pulseR, 0, Math.PI * 2);
+        ctx.strokeStyle = '#06b6d4';
+        ctx.lineWidth = 1.8;
+        ctx.stroke();
+
+        // Target center blip
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.arc(wx, wy, 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = '#06b6d4';
+        ctx.fill();
+
+        ctx.restore();
+      }
+
       // ── 6. Render Participant Avatars ──────────────────────────
       usersToRender.forEach((user) => {
         const x      = Math.max(20, Math.min(LOGICAL_W - 20, user.x));
@@ -982,5 +1074,5 @@ export function useOfficeCanvas(
 
     draw();
     return () => cancelAnimationFrame(frameId);
-  }, [canvasRef, usersRef, myId, currentRoom, roomInfo, profile, occupiedDesks, currentWorkstation]);
+  }, [canvasRef, usersRef, myId, currentRoom, roomInfo, profile, occupiedDesks, currentWorkstation, waypoint]);
 }
