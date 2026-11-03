@@ -30,6 +30,7 @@ export function WelcomePage({
   onJoin,
   connected,
   connecting,
+  connectionStatus = 'connecting',
   initialProfile,
   serverError,
   clearServerError,
@@ -46,7 +47,10 @@ export function WelcomePage({
   let connectionLabel = 'Connection failed';
   let connectionDotClass = 'connection-pill-dot error';
 
-  if (connecting) {
+  if (connectionStatus === 'reconnecting') {
+    connectionLabel = 'Reconnecting to office…';
+    connectionDotClass = 'connection-pill-dot connecting';
+  } else if (connecting) {
     connectionLabel = 'Connecting';
     connectionDotClass = 'connection-pill-dot connecting';
   } else if (connected) {

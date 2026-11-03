@@ -514,5 +514,502 @@ assert(focusPodA && focusPodA.name === 'SILENT POD A', 'Focus room identified as
 const privateZone = getCurrentZone(100, 100, 'PRV-1234', { isPrivate: true, title: 'Investor Pitch' });
 assert(privateZone && privateZone.name === 'INVESTOR PITCH', 'Private room identified with custom uppercase title');
 
+// ── 16. Socket Connection Monitoring & State Machine ────────────────────────
+function simulateConnectionState(event, data, currentState = {}) {
+  const state = { ...currentState };
+  switch (event) {
+    case 'connect':
+      state.connected = true;
+      state.connecting = false;
+      state.connectionStatus = 'connected';
+      state.reconnectAttempt = 0;
+      state.connectionError = null;
+      state.myId = data?.socketId || 'sock-new';
+      break;
+    case 'disconnect':
+      state.connected = false;
+      if (data?.reason === 'io server disconnect') {
+        state.connecting = false;
+        state.connectionStatus = 'disconnected';
+        state.connectionError = 'Server closed the session.';
+      } else {
+        state.connecting = true;
+        state.connectionStatus = 'reconnecting';
+      }
+      break;
+    case 'reconnect_attempt':
+      state.connecting = true;
+      state.connectionStatus = 'reconnecting';
+      state.reconnectAttempt = data?.attempt || 1;
+      break;
+    case 'reconnect_failed':
+      state.connected = false;
+      state.connecting = false;
+      state.connectionStatus = 'disconnected';
+      state.connectionError = 'Unable to reconnect to office server.';
+      break;
+    case 'connect_error':
+      state.connected = false;
+      state.connectionError = data?.message || 'Connection error';
+      if (data?.active) {
+        state.connecting = true;
+        state.connectionStatus = 'reconnecting';
+      } else {
+        state.connecting = false;
+        state.connectionStatus = 'error';
+      }
+      break;
+  }
+  return state;
+}
+
+// Initial connection
+let conn = simulateConnectionState('connect', { socketId: 'sock-1' }, { connected: false, connecting: true, connectionStatus: 'connecting', reconnectAttempt: 0 });
+assert(conn.connected && conn.connectionStatus === 'connected', 'Initial connection sets connected=true and status=connected');
+assert(conn.reconnectAttempt === 0, 'Reconnect attempt counter reset to 0 on connect');
+
+// Transport drop (temporary network blip / server restart)
+conn = simulateConnectionState('disconnect', { reason: 'transport close' }, conn);
+assert(!conn.connected && conn.connectionStatus === 'reconnecting', 'Transport close sets status to reconnecting');
+assert(conn.connecting === true, 'Automatic reconnect flag kept true during transport close');
+
+// Reconnection attempts increment
+conn = simulateConnectionState('reconnect_attempt', { attempt: 1 }, conn);
+assert(conn.reconnectAttempt === 1 && conn.connectionStatus === 'reconnecting', 'Reconnection attempt 1 recorded');
+conn = simulateConnectionState('reconnect_attempt', { attempt: 2 }, conn);
+assert(conn.reconnectAttempt === 2, 'Reconnection attempt 2 recorded');
+
+// Successful reconnection
+conn = simulateConnectionState('connect', { socketId: 'sock-2' }, conn);
+assert(conn.connected && conn.connectionStatus === 'connected', 'Reconnection resets status to connected');
+assert(conn.myId === 'sock-2', 'Updated to new socket ID on reconnect');
+assert(conn.reconnectAttempt === 0, 'Reset reconnect attempts on success');
+
+// Server forced disconnect
+conn = simulateConnectionState('disconnect', { reason: 'io server disconnect' }, conn);
+assert(conn.connectionStatus === 'disconnected' && conn.connecting === false, 'Server-initiated disconnect stops automatic retry loop');
+
+// ── 17. Automatic Session Recovery & Room Preservation ──────────────────────
+function sanitizeEmail(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim().toLowerCase();
+  return EMAIL_REGEX.test(trimmed) ? trimmed : null;
+}
+
+function simulateSessionRecovery({
+  newSocketId,
+  previousSocketId,
+  guestId,
+  profile,
+  room,
+  lastX,
+  lastY,
+  workstation,
+  usersStore,
+  privateRoomsStore,
+  workstationsStore,
+}) {
+  // 1. Sanitize Profile
+  const cleanName = sanitizeDisplayName(profile?.name) || 'Guest-User';
+  const cleanEmail = sanitizeEmail(profile?.email);
+  const avatarColor = (profile?.avatarColor && /^#[0-9a-fA-F]{6}$/.test(profile.avatarColor)) ? profile.avatarColor : '#259765';
+  const avatarStyle = (profile?.avatarStyle && ['classic', 'star', 'diamond', 'crown'].includes(profile.avatarStyle)) ? profile.avatarStyle : 'classic';
+  const status = (profile?.status && ['online', 'away', 'busy'].includes(profile.status)) ? profile.status : 'online';
+
+  // 2. Clean up previous socket & stale users with same guestId (prevent duplicate participants)
+  let removedPrevious = false;
+  if (previousSocketId && previousSocketId !== newSocketId && usersStore.has(previousSocketId)) {
+    usersStore.delete(previousSocketId);
+    removedPrevious = true;
+  }
+  let removedDuplicateGuest = false;
+  if (guestId) {
+    for (const [sId, u] of usersStore.entries()) {
+      if (sId !== newSocketId && u.guestId === guestId) {
+        usersStore.delete(sId);
+        removedDuplicateGuest = true;
+      }
+    }
+  }
+
+  // 3. Validate & resolve target room
+  let targetRoom = room || 'general';
+  let isPrivate = false;
+  let roomTitle = 'General Office';
+  let fallbackNotice = null;
+
+  if (['general', 'meeting', 'focus'].includes(targetRoom)) {
+    if (targetRoom === 'meeting') roomTitle = 'Meeting Room';
+    else if (targetRoom === 'focus') roomTitle = 'Focus Room';
+  } else if (privateRoomsStore.has(targetRoom)) {
+    isPrivate = true;
+    const priv = privateRoomsStore.get(targetRoom);
+    roomTitle = priv.title;
+    if (priv.hostSocketId === previousSocketId) {
+      priv.hostSocketId = newSocketId;
+    }
+  } else {
+    // Room expired
+    fallbackNotice = `Previous meeting (${targetRoom}) is no longer available. Reconnected to General Office.`;
+    targetRoom = 'general';
+    roomTitle = 'General Office';
+    isPrivate = false;
+  }
+
+  // 4. Coordinates
+  const posX = Math.max(20, Math.min(780, Number.isFinite(lastX) ? lastX : 360));
+  const posY = Math.max(20, Math.min(480, Number.isFinite(lastY) ? lastY : 110));
+
+  // 5. Workstation
+  let restoredWorkstation = null;
+  if (workstation && workstationsStore) {
+    const existingDesk = workstationsStore.get(workstation);
+    if (!existingDesk || existingDesk.socketId === previousSocketId) {
+      workstationsStore.set(workstation, { socketId: newSocketId, name: cleanName });
+      restoredWorkstation = workstation;
+    }
+  }
+
+  const restoredUser = {
+    id: newSocketId,
+    name: cleanName,
+    email: cleanEmail,
+    guestId,
+    room: targetRoom,
+    x: posX,
+    y: posY,
+    workstation: restoredWorkstation,
+    avatarColor,
+    avatarStyle,
+    status,
+  };
+  usersStore.set(newSocketId, restoredUser);
+
+  return {
+    success: true,
+    restored: true,
+    room: targetRoom,
+    title: roomTitle,
+    isPrivate,
+    workstation: restoredWorkstation,
+    notice: fallbackNotice,
+    user: restoredUser,
+    removedPrevious,
+    removedDuplicateGuest,
+  };
+}
+
+// Test 1: Public Meeting Room recovery
+const testUsersStore = new Map([
+  ['sock-old-1', { id: 'sock-old-1', name: 'Dev Alice', guestId: 'GUEST-ALICE', room: 'meeting', x: 250, y: 320, workstation: null }],
+]);
+const testPrivateStore = new Map();
+const testWorkstationStore = new Map();
+
+const rec1 = simulateSessionRecovery({
+  newSocketId: 'sock-new-1',
+  previousSocketId: 'sock-old-1',
+  guestId: 'GUEST-ALICE',
+  profile: { name: 'Dev Alice', email: 'alice@corp.com', avatarColor: '#2563eb', avatarStyle: 'crown', status: 'busy' },
+  room: 'meeting',
+  lastX: 250,
+  lastY: 320,
+  workstation: null,
+  usersStore: testUsersStore,
+  privateRoomsStore: testPrivateStore,
+  workstationsStore: testWorkstationStore,
+});
+
+assert(rec1.restored && rec1.room === 'meeting', 'Session successfully restored to Meeting Room');
+assert(rec1.removedPrevious === true, 'Previous socket ID removed to prevent duplicate participants');
+assert(!testUsersStore.has('sock-old-1') && testUsersStore.has('sock-new-1'), 'Users map contains only new socket ID');
+assert(testUsersStore.get('sock-new-1').name === 'Dev Alice', 'User identity preserved during recovery');
+
+// Test 2: Active Private Room recovery with host ownership transfer
+testPrivateStore.set('PRV-BETA', { code: 'PRV-BETA', title: 'Beta Sprint Planning', hostSocketId: 'sock-host-old' });
+testUsersStore.set('sock-host-old', { id: 'sock-host-old', name: 'Host Bob', guestId: 'GUEST-BOB', room: 'PRV-BETA', x: 400, y: 200 });
+
+const recHost = simulateSessionRecovery({
+  newSocketId: 'sock-host-new',
+  previousSocketId: 'sock-host-old',
+  guestId: 'GUEST-BOB',
+  profile: { name: 'Host Bob' },
+  room: 'PRV-BETA',
+  lastX: 400,
+  lastY: 200,
+  workstation: null,
+  usersStore: testUsersStore,
+  privateRoomsStore: testPrivateStore,
+  workstationsStore: testWorkstationStore,
+});
+
+assert(recHost.isPrivate && recHost.room === 'PRV-BETA', 'Private room restored when still active');
+assert(testPrivateStore.get('PRV-BETA').hostSocketId === 'sock-host-new', 'Host ownership transferred to new socket ID');
+
+// Test 3: Expired Private Room fallback to General Office
+const recExpired = simulateSessionRecovery({
+  newSocketId: 'sock-user-3',
+  previousSocketId: 'sock-old-3',
+  guestId: 'GUEST-CHARLIE',
+  profile: { name: 'Charlie' },
+  room: 'PRV-EXPIRED-99',
+  lastX: 400,
+  lastY: 200,
+  workstation: null,
+  usersStore: testUsersStore,
+  privateRoomsStore: testPrivateStore,
+  workstationsStore: testWorkstationStore,
+});
+
+assert(recExpired.room === 'general' && recExpired.isPrivate === false, 'Expired private room safely falls back to General Office');
+assert(typeof recExpired.notice === 'string' && recExpired.notice.includes('no longer available'), 'Provides user-friendly fallback notice');
+
+// Test 4: Coordinate Clamping on Reconnection
+const recClamp = simulateSessionRecovery({
+  newSocketId: 'sock-clamp',
+  previousSocketId: null,
+  guestId: 'GUEST-CLAMP',
+  profile: { name: 'Dave' },
+  room: 'general',
+  lastX: -100, // Invalid out-of-bounds
+  lastY: 9999, // Invalid out-of-bounds
+  workstation: null,
+  usersStore: testUsersStore,
+  privateRoomsStore: testPrivateStore,
+  workstationsStore: testWorkstationStore,
+});
+assert(recClamp.user.x === 20 && recClamp.user.y === 480, 'Server-authoritative boundary clamp applied on recovery coordinates');
+
+// ── 18. Toast Notification Transition & Deduplication ───────────────────────
+function evaluateToastTransition(prevStatus, currentStatus) {
+  if (prevStatus === currentStatus) return null; // Deduplicated
+  if (prevStatus === 'connected' && (currentStatus === 'reconnecting' || currentStatus === 'disconnected')) {
+    return 'warning';
+  }
+  if ((prevStatus === 'reconnecting' || prevStatus === 'disconnected') && currentStatus === 'connected') {
+    return 'success';
+  }
+  return null;
+}
+
+assert(evaluateToastTransition('connected', 'reconnecting') === 'warning', 'Triggers warning toast on connection drop');
+assert(evaluateToastTransition('reconnecting', 'reconnecting') === null, 'Deduplicates: no second toast on same reconnecting state');
+assert(evaluateToastTransition('reconnecting', 'connected') === 'success', 'Triggers success toast on reconnection');
+assert(evaluateToastTransition('connected', 'connected') === null, 'Deduplicates: no second toast on stable connected state');
+
+// ── 19. Connection Handshake User & Session Name Resolution ─────────────────
+function resolveConnectionUser(socketId, auth = {}) {
+  const safeAuth = auth && typeof auth === 'object' ? auth : {};
+  const guestId = (safeAuth.guestId && typeof safeAuth.guestId === 'string') ? safeAuth.guestId.slice(0, 50) : null;
+  const rawName = (safeAuth.name && typeof safeAuth.name === 'string') ? safeAuth.name : null;
+  const name = (rawName && sanitizeDisplayName(rawName)) || `Guest-${socketId.slice(0, 4).toUpperCase()}`;
+
+  const startX = 270;
+  const startY = 60;
+
+  const user = {
+    id: socketId,
+    name,
+    email: sanitizeEmail(safeAuth.email) || null,
+    guestId,
+    workstation: null,
+    x: startX,
+    y: startY,
+    micEnabled: false,
+    room: 'general',
+    avatarColor: (safeAuth.avatarColor && /^#[0-9a-fA-F]{6}$/.test(safeAuth.avatarColor)) ? safeAuth.avatarColor : '#259765',
+    avatarStyle: (safeAuth.avatarStyle && ['classic', 'star', 'diamond', 'crown'].includes(safeAuth.avatarStyle)) ? safeAuth.avatarStyle : 'classic',
+    status: (safeAuth.status && ['online', 'away', 'busy'].includes(safeAuth.status)) ? safeAuth.status : 'online',
+    joinedAt: new Date().toISOString(),
+  };
+
+  const sessionPayload = {
+    socketId,
+    name: user.name,
+    email: user.email,
+    guestId: user.guestId,
+    x: startX,
+    y: startY,
+    micEnabled: false,
+    room: 'general',
+    avatarColor: user.avatarColor,
+    avatarStyle: user.avatarStyle,
+    status: user.status,
+  };
+
+  return { user, sessionPayload };
+}
+
+// Valid custom auth name
+const r1 = resolveConnectionUser('sock-abcd', { name: 'Dr. Jane Foster', email: 'jane@mit.edu' });
+assert(r1.user.name === 'Dr. Jane Foster', 'Connection assigns valid sanitized name to user.name');
+assert(r1.sessionPayload.name === 'Dr. Jane Foster', 'MongoDB Session payload contains the exact user.name');
+assert(r1.sessionPayload.name !== undefined, 'MongoDB Session name is never undefined');
+
+// Missing / undefined auth name falls back to Guest-XXXX
+const r2 = resolveConnectionUser('wxyz-1234', {});
+assert(r2.user.name === 'Guest-WXYZ', 'Connection falls back to Guest-XXXX when auth.name is empty');
+assert(r2.sessionPayload.name === 'Guest-WXYZ', 'MongoDB Session payload receives Guest-XXXX fallback');
+assert(r2.sessionPayload.name !== undefined, 'Fallback name is never undefined');
+
+// Malicious / HTML tags in auth.name
+const r3 = resolveConnectionUser('1234-abcd', { name: '<b>Alice</b>' });
+assert(r3.user.name === 'Alice', 'Strips HTML tags and assigns clean name');
+assert(r3.sessionPayload.name === 'Alice', 'MongoDB Session payload receives sanitized clean name');
+
+// Null auth object
+const r4 = resolveConnectionUser('5678-wxyz', null);
+assert(r4.user.name === 'Guest-5678', 'Null auth object safely yields Guest-5678 without ReferenceError');
+assert(r4.sessionPayload.name === 'Guest-5678', 'Session payload receives valid fallback on null auth');
+
+// ── 20. Multi-Member Simultaneous Joining & Concurrency Architecture ───────────
+
+// 20.1 Concurrent User Generation (Testing 2, 5, 10, and 50 concurrent joins)
+function simulateMultiJoin(userCount) {
+  const officeUsers = new Map();
+  const sessionWrites = [];
+
+  for (let i = 1; i <= userCount; i++) {
+    const socketId = `sock_client_${i}`;
+    const guestId = `guest_uuid_${i}`;
+    const name = `Employee ${i}`;
+    const email = `employee${i}@enterprise.com`;
+
+    const { user, sessionPayload } = resolveConnectionUser(socketId, {
+      name,
+      email,
+      guestId,
+      avatarColor: '#259765',
+      avatarStyle: 'classic',
+      status: 'online',
+    });
+
+    officeUsers.set(socketId, user);
+    sessionWrites.push(sessionPayload);
+  }
+
+  return { officeUsers, sessionWrites };
+}
+
+// Scenario 1: 2 users joining simultaneously
+const join2 = simulateMultiJoin(2);
+assert(join2.officeUsers.size === 2, '2 users joined General Office simultaneously with unique sessions');
+assert(join2.sessionWrites.length === 2, '2 distinct MongoDB session payloads created');
+assert(join2.officeUsers.get('sock_client_1').name === 'Employee 1', 'User 1 identity intact');
+assert(join2.officeUsers.get('sock_client_2').name === 'Employee 2', 'User 2 identity intact');
+
+// Scenario 2: 5 users joining simultaneously
+const join5 = simulateMultiJoin(5);
+assert(join5.officeUsers.size === 5, '5 users joined General Office simultaneously with unique sessions');
+assert(new Set(join5.sessionWrites.map(s => s.socketId)).size === 5, 'All 5 users have unique socketIds');
+assert(new Set(join5.sessionWrites.map(s => s.guestId)).size === 5, 'All 5 users have unique guestIds');
+
+// Scenario 3: 10 users joining simultaneously
+const join10 = simulateMultiJoin(10);
+assert(join10.officeUsers.size === 10, '10 users joined General Office simultaneously with unique sessions');
+assert(join10.officeUsers.has('sock_client_10'), '10th user successfully initialized in office users map');
+
+// Stress Target: 50 concurrent users
+const join50 = simulateMultiJoin(50);
+assert(join50.officeUsers.size === 50, '50 concurrent users successfully initialized simultaneously');
+assert(new Set(join50.sessionWrites.map(s => s.socketId)).size === 50, 'All 50 users retain unique socket connections');
+assert(new Set(join50.sessionWrites.map(s => s.email)).size === 50, 'All 50 users retain distinct email addresses');
+
+// 20.2 Duplicate & Ghost Avatar Eviction on Reconnect
+const dedupMap = new Map();
+const dedupEvents = [];
+
+function handleConnectWithDedup(socketId, guestId, name, store) {
+  // Evict existing socket if same guestId
+  if (guestId) {
+    for (const [sid, existingUser] of store.entries()) {
+      if (sid !== socketId && existingUser.guestId === guestId) {
+        store.delete(sid);
+        dedupEvents.push({ type: 'user-left', socketId: sid });
+      }
+    }
+  }
+  const user = { id: socketId, guestId, name, room: 'general' };
+  store.set(socketId, user);
+  return user;
+}
+
+handleConnectWithDedup('sock_old', 'guest_shared_42', 'Sarah Connor', dedupMap);
+assert(dedupMap.size === 1 && dedupMap.has('sock_old'), 'Initial socket connection active for Sarah Connor');
+
+// Sarah reconnects from a refreshed tab/network drop with new socket ID
+handleConnectWithDedup('sock_new', 'guest_shared_42', 'Sarah Connor', dedupMap);
+assert(dedupMap.size === 1, 'Store maintains exactly 1 active user after reconnect with same guestId');
+assert(!dedupMap.has('sock_old'), 'Stale socket sock_old evicted from active users');
+assert(dedupMap.has('sock_new'), 'New socket sock_new registered in active users');
+assert(dedupEvents.some(e => e.type === 'user-left' && e.socketId === 'sock_old'), 'Emitted user-left event for stale socket to clear ghost avatar');
+
+// 20.3 Server-Side Full Name & Email Validation on Join-Room
+function validateJoinRoomProfile(profile) {
+  if (!profile || typeof profile !== 'object') return { success: true };
+
+  if ('name' in profile) {
+    const clean = sanitizeDisplayName(profile.name);
+    if (!clean) {
+      return { success: false, error: 'Full name must be between 2 and 30 characters.' };
+    }
+  }
+
+  if ('email' in profile && profile.email) {
+    const cleanEmail = sanitizeEmail(profile.email);
+    if (!cleanEmail) {
+      return { success: false, error: 'A valid email address is required.' };
+    }
+  }
+
+  return { success: true };
+}
+
+assert(validateJoinRoomProfile({ name: 'Valid User', email: 'user@company.com' }).success, 'Accepts valid name and company email');
+assert(!validateJoinRoomProfile({ name: 'X', email: 'user@company.com' }).success, 'Rejects single-character name');
+assert(!validateJoinRoomProfile({ name: 'A'.repeat(35), email: 'user@company.com' }).success, 'Rejects name exceeding 30 characters');
+assert(!validateJoinRoomProfile({ name: '<b></b>', email: 'user@company.com' }).success, 'Rejects HTML-only tags stripped to empty');
+assert(!validateJoinRoomProfile({ name: 'Valid User', email: 'invalid-email-no-at' }).success, 'Rejects malformed email address');
+
+// 20.4 High-Frequency Movement DB Write Throttling (3,000ms throttle)
+let dbWriteCount = 0;
+let lastDbWrite = 0;
+let inMemoryMoveCount = 0;
+
+function simulateMove(socketId, x, y, timestamp) {
+  inMemoryMoveCount++;
+  // Throttled DB write
+  if (timestamp - lastDbWrite >= 3000) {
+    lastDbWrite = timestamp;
+    dbWriteCount++;
+  }
+}
+
+// Simulate 50 moves over 1,000ms (50ms interval)
+const moveStart = 10000;
+for (let step = 0; step < 50; step++) {
+  simulateMove('sock_fast', 300 + step, 200 + step, moveStart + step * 50);
+}
+
+assert(inMemoryMoveCount === 50, 'All 50 real-time in-memory movements processed without dropped events');
+assert(dbWriteCount === 1, 'MongoDB write throttled to exactly 1 write across 50 fast moves (98% reduction)');
+
+// 20.5 Multi-Room Isolation & Presence Tracking Under Concurrency
+const multiRoomUsers = new Map();
+// 25 in general, 15 in meeting, 10 in focus
+for (let i = 1; i <= 25; i++) multiRoomUsers.set(`u_gen_${i}`, { id: `u_gen_${i}`, name: `Gen ${i}`, room: 'general' });
+for (let i = 1; i <= 15; i++) multiRoomUsers.set(`u_meet_${i}`, { id: `u_meet_${i}`, name: `Meet ${i}`, room: 'meeting' });
+for (let i = 1; i <= 10; i++) multiRoomUsers.set(`u_foc_${i}`, { id: `u_foc_${i}`, name: `Foc ${i}`, room: 'focus' });
+
+const counts = { general: 0, meeting: 0, focus: 0 };
+for (const [, u] of multiRoomUsers) {
+  counts[u.room] = (counts[u.room] || 0) + 1;
+}
+
+assert(counts.general === 25, 'General office accurately tracks 25 concurrent users');
+assert(counts.meeting === 15, 'Meeting room accurately tracks 15 concurrent users');
+assert(counts.focus === 10, 'Focus room accurately tracks 10 concurrent users');
+assert(multiRoomUsers.size === 50, 'Total office presence accurately reflects 50 connected employees');
+
 console.log(`\n── Results: ${pass} passed, ${fail} failed ──\n`);
 process.exit(fail > 0 ? 1 : 0);

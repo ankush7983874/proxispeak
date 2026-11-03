@@ -22,6 +22,7 @@ import { getNearbyUsers, EARSHOT_RADIUS, volumeFromDistance } from './utils/prox
 import { WelcomePage }     from './components/WelcomePage.jsx';
 import { PresencePanel }   from './components/PresencePanel.jsx';
 import { OfficeMinimap }   from './components/OfficeMinimap.jsx';
+import { ConnectionIndicator, ConnectionToast } from './components/ConnectionStatus.jsx';
 
 import {
   BuildingIcon,
@@ -78,6 +79,15 @@ export default function App() {
     socket,
     connected,
     connecting,
+    connectionStatus,
+    reconnectAttempt,
+    connectionError,
+    recoveryNotice,
+    clearRecoveryNotice,
+    wasReconnected,
+    setWasReconnected,
+    reconnect,
+    setJoinedOffice,
     myId,
     users,
     usersRef,
@@ -138,6 +148,14 @@ export default function App() {
     cleanAllPeers();
   }, [currentRoom, cleanAllPeers]);
 
+  // Teardown previous audio connections on reconnection so audio renegotiates cleanly
+  useEffect(() => {
+    if (wasReconnected) {
+      cleanAllPeers();
+      setWasReconnected(false);
+    }
+  }, [wasReconnected, cleanAllPeers, setWasReconnected]);
+
   // If a room error occurs (e.g. invalid invite code), keep user on welcome screen
   useEffect(() => {
     if (roomError) {
@@ -192,6 +210,7 @@ export default function App() {
 
           if (success) {
             setHasJoined(true);
+            setJoinedOffice(true);
             resolve();
           } else {
             reject(new Error(errorMsg || 'Failed to join room.'));
@@ -219,7 +238,7 @@ export default function App() {
         });
       });
     },
-    [connected, updateProfile, joinRoom, profile, socket]
+    [connected, updateProfile, joinRoom, profile, socket, setJoinedOffice]
   );
 
   // ── Leave Office (Return to Welcome Screen) ───────────────────────────────
@@ -228,8 +247,9 @@ export default function App() {
     disableMic();
     leaveOffice();
     setHasJoined(false);
+    setJoinedOffice(false);
     clearRoomError();
-  }, [cleanAllPeers, disableMic, leaveOffice, clearRoomError]);
+  }, [cleanAllPeers, disableMic, leaveOffice, setJoinedOffice, clearRoomError]);
 
   // ── Movement Handler with Furniture Collision & Sliding ────────────────────
   const move = useCallback(
@@ -466,19 +486,6 @@ export default function App() {
     setShowLeaveConfirm(false);
   };
 
-  // ── Connection Status Details ─────────────────────────────────────────────
-  const connectionLabel = connecting
-    ? 'Connecting to office…'
-    : connected
-    ? 'Connected'
-    : 'Disconnected';
-
-  const dotClass = connecting
-    ? 'status-dot'
-    : connected
-    ? 'status-dot online'
-    : 'status-dot error';
-
   const statusColor = (status) => {
     if (status === 'busy') return '#ef4444';
     if (status === 'away') return '#f59e0b';
@@ -491,20 +498,41 @@ export default function App() {
   // ── Render ────────────────────────────────────────────────────────────────
   if (!hasJoined) {
     return (
-      <WelcomePage
-        onJoin={handleJoinOffice}
-        connected={connected}
-        connecting={connecting}
-        initialProfile={profile}
-        roomCounts={roomCounts}
-        serverError={roomError}
-        clearServerError={clearRoomError}
-      />
+      <>
+        <ConnectionToast
+          connectionStatus={connectionStatus}
+          connectionError={connectionError}
+          wasReconnected={wasReconnected}
+          recoveryNotice={recoveryNotice}
+          onClearRecoveryNotice={clearRecoveryNotice}
+          onReconnect={reconnect}
+        />
+        <WelcomePage
+          onJoin={handleJoinOffice}
+          connected={connected}
+          connecting={connecting}
+          connectionStatus={connectionStatus}
+          initialProfile={profile}
+          roomCounts={roomCounts}
+          serverError={roomError}
+          clearServerError={clearRoomError}
+        />
+      </>
     );
   }
 
   return (
     <main className="app-shell">
+      {/* ── Real-Time Connection Toast Notification ─────────────────────── */}
+      <ConnectionToast
+        connectionStatus={connectionStatus}
+        connectionError={connectionError}
+        wasReconnected={wasReconnected}
+        recoveryNotice={recoveryNotice}
+        onClearRecoveryNotice={clearRecoveryNotice}
+        onReconnect={reconnect}
+      />
+
       {/* ── Top Navigation Bar ─────────────────────────────────────────────── */}
       <header className="topbar">
         <a className="brand" href="/" aria-label="ProxiSpeak home">
@@ -525,17 +553,11 @@ export default function App() {
         </div>
 
         <div className="topbar-right">
-          {connecting && (
-            <div className="state-banner connecting" role="status">
-              <span className="spinner" />
-              Connecting…
-            </div>
-          )}
-
-          <div className="connection" role="status" aria-live="polite">
-            <span className={dotClass} />
-            <span>{connectionLabel}</span>
-          </div>
+          <ConnectionIndicator
+            connectionStatus={connectionStatus}
+            reconnectAttempt={reconnectAttempt}
+            onReconnect={reconnect}
+          />
 
           <button
             type="button"

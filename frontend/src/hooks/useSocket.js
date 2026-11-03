@@ -7,10 +7,15 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import socket from '../services/socket.js';
 
 export function useSocket() {
-  const [connected, setConnected]   = useState(false);
-  const [connecting, setConnecting] = useState(true);
-  const [myId, setMyId]             = useState('');
-  const [users, setUsers]           = useState([]);
+  const [connected, setConnected]             = useState(false);
+  const [connecting, setConnecting]           = useState(true);
+  const [connectionStatus, setConnectionStatus] = useState('connecting'); // 'connected' | 'reconnecting' | 'disconnected' | 'error'
+  const [reconnectAttempt, setReconnectAttempt] = useState(0);
+  const [connectionError, setConnectionError] = useState(null);
+  const [recoveryNotice, setRecoveryNotice]   = useState(null);
+  const [wasReconnected, setWasReconnected]   = useState(false);
+  const [myId, setMyId]                       = useState('');
+  const [users, setUsers]                     = useState([]);
 
   // Phase 3 Room & Profile States
   const [currentRoom, setCurrentRoom] = useState('general');
@@ -24,14 +29,25 @@ export function useSocket() {
   const [roomCounts, setRoomCounts]   = useState({ general: 0, meeting: 0, focus: 0 });
   const [roomError, setRoomError]     = useState(null);
 
-  // Avatar profile with localStorage persistence
+  // Avatar profile with per-tab guest isolation and localStorage persistence
   const [profile, setProfile] = useState(() => {
+    let tabGuestId = null;
+    try {
+      tabGuestId = sessionStorage.getItem('proxispeak_guest_id');
+      if (!tabGuestId) {
+        tabGuestId = `guest_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+        sessionStorage.setItem('proxispeak_guest_id', tabGuestId);
+      }
+    } catch {
+      tabGuestId = `guest_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+    }
+
     try {
       const saved = localStorage.getItem('proxispeak_profile');
       if (saved) {
         const parsed = JSON.parse(saved);
         return {
-          guestId: parsed.guestId || `guest_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+          guestId: tabGuestId,
           name: typeof parsed.name === 'string' ? parsed.name : '',
           email: typeof parsed.email === 'string' ? parsed.email : '',
           avatarColor: parsed.avatarColor || '#259765',
@@ -43,7 +59,7 @@ export function useSocket() {
       // ignore
     }
     return {
-      guestId: `guest_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+      guestId: tabGuestId,
       name: '',
       email: '',
       avatarColor: '#259765',
@@ -61,6 +77,33 @@ export function useSocket() {
   // Workstation state
   const [occupiedDesks, setOccupiedDesks] = useState({});
   const [currentWorkstation, setCurrentWorkstation] = useState(null);
+
+  // Reconnection and recovery refs
+  const previousSocketIdRef   = useRef(null);
+  const currentRoomRef        = useRef(currentRoom);
+  const roomInfoRef           = useRef(roomInfo);
+  const profileRef            = useRef(profile);
+  const currentWorkstationRef = useRef(currentWorkstation);
+  const lastPosRef            = useRef({ x: 360, y: 110 });
+  const hasJoinedRef          = useRef(false);
+
+  useEffect(() => { currentRoomRef.current = currentRoom; }, [currentRoom]);
+  useEffect(() => { roomInfoRef.current = roomInfo; }, [roomInfo]);
+  useEffect(() => { profileRef.current = profile; }, [profile]);
+  useEffect(() => { currentWorkstationRef.current = currentWorkstation; }, [currentWorkstation]);
+
+  // Keep socket.auth populated so Socket.IO sends current identity on reconnection
+  useEffect(() => {
+    socket.auth = {
+      guestId: profile.guestId,
+      name: profile.name,
+      email: profile.email,
+      avatarColor: profile.avatarColor,
+      avatarStyle: profile.avatarStyle,
+      status: profile.status,
+      room: currentRoom,
+    };
+  }, [profile, currentRoom]);
 
   // Keep users in a ref so canvas draw loop always has the latest value
   // without re-creating the draw loop itself.
@@ -92,41 +135,126 @@ export function useSocket() {
       return prev;
     });
 
-    socket.connect();
-    setConnecting(true);
+    if (!socket.connected) {
+      socket.connect();
+      setConnecting(true);
+      setConnectionStatus('connecting');
+    }
 
     const onConnect = () => {
+      const prevId = previousSocketIdRef.current;
+      const isReconnect = Boolean(prevId && prevId !== socket.id);
+
       setConnected(true);
       setConnecting(false);
+      setConnectionStatus('connected');
+      setReconnectAttempt(0);
+      setConnectionError(null);
       setMyId(socket.id);
 
-      // If user had a saved profile name or custom color, sync to server
-      if (profile.name || profile.avatarColor !== '#2563eb' || profile.avatarStyle !== 'classic') {
-        socket.emit('update-profile', profile);
+      // Session & Room recovery upon automatic reconnection
+      if (isReconnect && hasJoinedRef.current) {
+        const recoveryData = {
+          previousSocketId: prevId,
+          guestId: profileRef.current?.guestId,
+          profile: profileRef.current,
+          room: currentRoomRef.current,
+          lastX: lastPosRef.current?.x,
+          lastY: lastPosRef.current?.y,
+          workstation: currentWorkstationRef.current?.id,
+        };
+
+        socket.emit('recover-session', recoveryData, (res) => {
+          if (res && res.success) {
+            if (res.notice) {
+              setRecoveryNotice(res.notice);
+            }
+            if (res.room && res.room !== currentRoomRef.current) {
+              setCurrentRoom(res.room);
+            }
+            setWasReconnected(true);
+          }
+        });
+      } else {
+        // Initial connect or profile sync
+        if (profileRef.current.name || profileRef.current.avatarColor !== '#2563eb' || profileRef.current.avatarStyle !== 'classic') {
+          socket.emit('update-profile', profileRef.current);
+        }
+      }
+
+      previousSocketIdRef.current = socket.id;
+    };
+
+    const onDisconnect = (reason) => {
+      setConnected(false);
+      if (reason === 'io server disconnect') {
+        setConnecting(false);
+        setConnectionStatus('disconnected');
+        setConnectionError('Server closed the session. Click Reconnect to try again.');
+      } else {
+        // Transport error or ping timeout: auto-reconnecting
+        setConnecting(true);
+        setConnectionStatus('reconnecting');
       }
     };
 
-    const onDisconnect = () => {
+    const onConnectError = (err) => {
       setConnected(false);
-      setConnecting(false);
+      setConnectionError(err?.message || 'Connection error');
+      if (socket.active) {
+        setConnecting(true);
+        setConnectionStatus('reconnecting');
+      } else {
+        setConnecting(false);
+        setConnectionStatus('error');
+      }
     };
 
-    const onConnectError = () => {
-      setConnected(false);
-      setConnecting(false);
-    };
-
-    const onReconnectAttempt = () => {
+    const onReconnectAttempt = (attempt) => {
       setConnecting(true);
+      setConnectionStatus('reconnecting');
+      setReconnectAttempt(attempt);
+    };
+
+    const onReconnect = () => {
+      setConnected(true);
+      setConnecting(false);
+      setConnectionStatus('connected');
+      setReconnectAttempt(0);
+      setConnectionError(null);
+    };
+
+    const onReconnectError = (err) => {
+      setConnectionError(err?.message || 'Reconnection error');
+    };
+
+    const onReconnectFailed = () => {
+      setConnected(false);
+      setConnecting(false);
+      setConnectionStatus('disconnected');
+      setConnectionError('Unable to reconnect to office server. Click to retry.');
     };
 
     const onInitialUsers = (serverUsers) => {
-      setUsersSync(serverUsers);
+      if (!Array.isArray(serverUsers)) return;
+      // Deduplicate by ID and guestId, filter out preview avatar
+      const seenIds = new Set();
+      const seenGuests = new Set();
+      const cleanUsers = [];
+      for (const u of serverUsers) {
+        if (!u || !u.id || seenIds.has(u.id)) continue;
+        if (u.guestId && seenGuests.has(u.guestId)) continue;
+        seenIds.add(u.id);
+        if (u.guestId) seenGuests.add(u.guestId);
+        cleanUsers.push(u);
+      }
+      setUsersSync(cleanUsers);
     };
 
     const onUserJoined = (user) => {
+      if (!user || !user.id) return;
       setUsersSync((prev) => [
-        ...prev.filter((u) => u.id !== user.id),
+        ...prev.filter((u) => u.id !== user.id && (!user.guestId || u.guestId !== user.guestId) && u.id !== 'local-preview'),
         user,
       ]);
     };
@@ -194,6 +322,9 @@ export function useSocket() {
     socket.on('disconnect',           onDisconnect);
     socket.on('connect_error',        onConnectError);
     socket.io.on('reconnect_attempt', onReconnectAttempt);
+    socket.io.on('reconnect',         onReconnect);
+    socket.io.on('reconnect_error',   onReconnectError);
+    socket.io.on('reconnect_failed',  onReconnectFailed);
     socket.on('initial-users',        onInitialUsers);
     socket.on('user-joined',          onUserJoined);
     socket.on('user-moved',           onUserMoved);
@@ -212,6 +343,9 @@ export function useSocket() {
       socket.off('disconnect',           onDisconnect);
       socket.off('connect_error',        onConnectError);
       socket.io.off('reconnect_attempt', onReconnectAttempt);
+      socket.io.off('reconnect',         onReconnect);
+      socket.io.off('reconnect_error',   onReconnectError);
+      socket.io.off('reconnect_failed',  onReconnectFailed);
       socket.off('initial-users',        onInitialUsers);
       socket.off('user-joined',          onUserJoined);
       socket.off('user-moved',           onUserMoved);
@@ -229,10 +363,34 @@ export function useSocket() {
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   /**
+   * Manual reconnect trigger with safety check
+   */
+  const reconnect = useCallback(() => {
+    if (!socket.connected) {
+      setConnecting(true);
+      setConnectionStatus('reconnecting');
+      setConnectionError(null);
+      socket.connect();
+    }
+  }, []);
+
+  /**
+   * Update virtual office entered/left flag for session recovery
+   */
+  const setJoinedOffice = useCallback((joined) => {
+    hasJoinedRef.current = Boolean(joined);
+  }, []);
+
+  const clearRecoveryNotice = useCallback(() => {
+    setRecoveryNotice(null);
+  }, []);
+
+  /**
    * Emit a throttled move event.
    * The server enforces clamping; during offline preview we move locally.
    */
   const emitMove = useCallback((x, y) => {
+    lastPosRef.current = { x, y };
     if (socket.connected) {
       socket.emit('move', { x, y });
     } else {
@@ -283,6 +441,7 @@ export function useSocket() {
    * Leave the virtual office and return to welcome page
    */
   const leaveOffice = useCallback(() => {
+    hasJoinedRef.current = false;
     if (socket.connected) {
       socket.emit('leave-office');
     }
@@ -316,6 +475,9 @@ export function useSocket() {
     setProfile(merged);
     try {
       localStorage.setItem('proxispeak_profile', JSON.stringify(merged));
+      if (merged.guestId) {
+        sessionStorage.setItem('proxispeak_guest_id', merged.guestId);
+      }
     } catch {
       // ignore
     }
@@ -376,6 +538,15 @@ export function useSocket() {
     socket,
     connected,
     connecting,
+    connectionStatus,
+    reconnectAttempt,
+    connectionError,
+    recoveryNotice,
+    clearRecoveryNotice,
+    wasReconnected,
+    setWasReconnected,
+    reconnect,
+    setJoinedOffice,
     myId,
     users,
     usersRef,

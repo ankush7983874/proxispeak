@@ -195,6 +195,229 @@ body {
   border: 1px solid var(--border-subtle);
 }
 
+/* ── Production Connection Indicator ───────────────────────────── */
+.connection-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.95);
+  backdrop-filter: blur(8px);
+  transition: all 0.25s ease;
+  user-select: none;
+}
+
+.connection-indicator.connected {
+  border-color: rgba(16, 185, 129, 0.25);
+  background: rgba(240, 253, 244, 0.85);
+  color: #065f46;
+}
+
+.connection-indicator.reconnecting {
+  border-color: rgba(245, 158, 11, 0.35);
+  background: rgba(254, 252, 232, 0.95);
+  color: #92400e;
+  animation: reconnecting-breathe 2s infinite ease-in-out;
+}
+
+.connection-indicator.disconnected {
+  border-color: rgba(239, 68, 68, 0.35);
+  background: rgba(254, 242, 242, 0.95);
+  color: #991b1b;
+}
+
+.connection-text {
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+
+.connection-spinner {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 2px solid rgba(245, 158, 11, 0.3);
+  border-top-color: #f59e0b;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+.btn-indicator-retry {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: #dc2626;
+  color: #ffffff;
+  border: none;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  margin-left: 2px;
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+
+.btn-indicator-retry:hover {
+  background: #b91c1c;
+  transform: scale(1.03);
+}
+
+@keyframes reconnecting-breathe {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.25);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.1);
+  }
+}
+
+/* ── Connection Toast Notification ─────────────────────────────── */
+.connection-toast-wrap {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 18px;
+  max-width: 440px;
+  border-radius: 12px;
+  background: #ffffff;
+  box-shadow: 0 10px 30px -5px rgba(15, 23, 42, 0.16), 0 0 0 1px rgba(15, 23, 42, 0.08);
+  font-size: 13px;
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.connection-toast-wrap.warning {
+  border-left: 4px solid #f59e0b;
+  background: #fffdfa;
+}
+.connection-toast-wrap.warning .connection-toast-icon {
+  color: #f59e0b;
+}
+
+.connection-toast-wrap.success {
+  border-left: 4px solid #10b981;
+  background: #f0fdf4;
+}
+.connection-toast-wrap.success .connection-toast-icon {
+  color: #10b981;
+}
+
+.connection-toast-wrap.info {
+  border-left: 4px solid #2563eb;
+  background: #eff6ff;
+}
+.connection-toast-wrap.info .connection-toast-icon {
+  color: #2563eb;
+}
+
+.connection-toast-wrap.error {
+  border-left: 4px solid #ef4444;
+  background: #fef2f2;
+}
+.connection-toast-wrap.error .connection-toast-icon {
+  color: #ef4444;
+}
+
+.connection-toast-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.connection-toast-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.connection-toast-title {
+  font-weight: 700;
+  font-size: 13px;
+  color: #0f172a;
+  margin-bottom: 2px;
+}
+
+.connection-toast-message {
+  font-size: 12px;
+  color: #475569;
+  line-height: 1.4;
+}
+
+.connection-toast-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.btn-toast-retry {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: #2563eb;
+  color: #ffffff;
+  border: none;
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.btn-toast-retry:hover {
+  background: #1d4ed8;
+}
+
+.btn-toast-close {
+  background: transparent;
+  border: none;
+  color: #94a3b8;
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+
+.btn-toast-close:hover {
+  color: #0f172a;
+  background: rgba(0, 0, 0, 0.05);
+}
+
+@keyframes slide-in-up {
+  from {
+    transform: translateY(20px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.animate-slide-in {
+  animation: slide-in-up 0.28s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@media (max-width: 640px) {
+  .connection-toast-wrap {
+    left: 16px;
+    right: 16px;
+    bottom: 16px;
+    max-width: none;
+  }
+}
+
 .status-dot {
   width: 8px;
   height: 8px;

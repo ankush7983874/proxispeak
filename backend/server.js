@@ -280,8 +280,12 @@ app.get('/api/users/nearby', async (req, res) => {
 // ── Socket.IO ────────────────────────────────────────────────────────────────
 
 io.on('connection', async (socket) => {
-  // Generate a display name server-side — client can update via update-profile
-  const name = `Guest-${socket.id.slice(0, 4).toUpperCase()}`;
+  const auth = (socket.handshake && socket.handshake.auth && typeof socket.handshake.auth === 'object')
+    ? socket.handshake.auth
+    : {};
+  const guestId = (auth.guestId && typeof auth.guestId === 'string') ? auth.guestId.slice(0, 50) : null;
+  const rawName = (auth.name && typeof auth.name === 'string') ? auth.name : null;
+  const name = (rawName && sanitizeDisplayName(rawName)) || `Guest-${socket.id.slice(0, 4).toUpperCase()}`;
 
   // Spawn at a random position inside the collaboration area
   const startX = 270 + Math.floor(Math.random() * 180);
@@ -290,18 +294,37 @@ io.on('connection', async (socket) => {
   const user = {
     id: socket.id,
     name,
-    email: null,
-    guestId: null,
+    email: sanitizeEmail(auth.email) || null,
+    guestId,
     workstation: null,
     x: startX,
     y: startY,
     micEnabled: false,
     room: 'general',
-    avatarColor: '#259765',
-    avatarStyle: 'classic',
-    status: 'online',
+    avatarColor: (auth.avatarColor && /^#[0-9a-fA-F]{6}$/.test(auth.avatarColor)) ? auth.avatarColor : '#259765',
+    avatarStyle: (auth.avatarStyle && VALID_STYLES.has(auth.avatarStyle)) ? auth.avatarStyle : 'classic',
+    status: (auth.status && VALID_STATUSES.has(auth.status)) ? auth.status : 'online',
     joinedAt: new Date().toISOString(),
   };
+
+  // Evict any existing user in memory holding the same guestId (prevents duplicate / ghost avatars)
+  if (guestId) {
+    for (const [sid, existingUser] of users.entries()) {
+      if (sid !== socket.id && existingUser.guestId === guestId) {
+        log('log', `[DEDUP] Evicting stale socket ${sid} for guestId ${guestId} on new connection`);
+        users.delete(sid);
+        if (existingUser.workstation) {
+          occupiedWorkstations.delete(existingUser.workstation);
+        }
+        socket.to(existingUser.room || 'general').emit('user-left', sid);
+        const dbStatus = getDBStatus();
+        if (dbStatus.connected) {
+          Session.deleteOne({ socketId: sid }).catch(() => {});
+        }
+      }
+    }
+  }
+
   users.set(socket.id, user);
 
   // Join default public room
@@ -313,9 +336,14 @@ io.on('connection', async (socket) => {
   // Persist to MongoDB (non-blocking; log error but don't crash)
   const db = getDBStatus();
   if (db.connected) {
+    if (user.guestId) {
+      Session.deleteMany({ guestId: user.guestId, socketId: { $ne: socket.id } }).catch(() => {});
+    }
     Session.create({
       socketId:    socket.id,
-      name,
+      name:        user.name,
+      email:       user.email,
+      guestId:     user.guestId,
       x:           startX,
       y:           startY,
       micEnabled:  false,
@@ -341,13 +369,14 @@ io.on('connection', async (socket) => {
   io.emit('room-counts', getRoomCounts());
   io.emit('presence-list', getOfficePresence());
 
-  log('log', `[CONNECT] ${name} (${socket.id}) joined general — ${users.size} total`);
+  log('log', `[CONNECT] ${user.name} (${socket.id}) joined general — ${users.size} total`);
 
   // ── Move event (room-scoped) ───────────────────────────────────────────
   let lastMoveAt = 0;
+  let lastDbMoveWriteAt = 0;
 
   socket.on('move', async (position) => {
-    // Rate limit
+    // Rate limit movement events
     const now = Date.now();
     if (now - lastMoveAt < MOVE_RATE_MS) return;
     lastMoveAt = now;
@@ -360,15 +389,16 @@ io.on('connection', async (socket) => {
     user.x = x;
     user.y = y;
 
-    // Broadcast updated position ONLY to users in the same room
+    // Broadcast updated position ONLY to users in the same room (in-memory, immediate)
     io.to(user.room).emit('user-moved', user);
 
     // Compute proximity within the current room and notify this user
     const nearby = getNearbyUsers(user, users);
     socket.emit('proximity-update', nearby.map((n) => n.user.id));
 
-    // Persist updated position to MongoDB (non-blocking)
-    if (db.connected) {
+    // Persist updated position to MongoDB throttled to at most once per 3s per user
+    if (db.connected && (now - lastDbMoveWriteAt >= 3000)) {
+      lastDbMoveWriteAt = now;
       Session.updateOne(
         { socketId: socket.id },
         {
@@ -378,7 +408,7 @@ io.on('connection', async (socket) => {
             lastSeen: new Date(),
           },
         }
-      ).catch((err) => log('warn', `[DB] Session update failed: ${err.message}`));
+      ).catch((err) => log('warn', `[DB] Move update failed: ${err.message}`));
     }
   });
 
@@ -414,19 +444,33 @@ io.on('connection', async (socket) => {
 
     const oldRoom = user.room;
 
-    // Optional profile update on join
+    // Optional profile update on join with strict validation
     let profileUpdated = false;
     if (profile && typeof profile === 'object') {
-      if (profile.name) {
+      if ('name' in profile) {
         const clean = sanitizeDisplayName(profile.name);
-        if (clean && clean !== user.name) {
+        if (!clean) {
+          socket.emit('room-error', { message: 'Full name must be between 2 and 30 characters.' });
+          if (typeof callback === 'function') {
+            callback({ success: false, error: 'Full name must be between 2 and 30 characters.' });
+          }
+          return;
+        }
+        if (clean !== user.name) {
           user.name = clean;
           profileUpdated = true;
         }
       }
-      if (profile.email) {
+      if ('email' in profile && profile.email) {
         const cleanEmail = sanitizeEmail(profile.email);
-        if (cleanEmail && cleanEmail !== user.email) {
+        if (!cleanEmail) {
+          socket.emit('room-error', { message: 'A valid email address is required.' });
+          if (typeof callback === 'function') {
+            callback({ success: false, error: 'A valid email address is required.' });
+          }
+          return;
+        }
+        if (cleanEmail !== user.email) {
           user.email = cleanEmail;
           profileUpdated = true;
         }
@@ -450,6 +494,31 @@ io.on('connection', async (socket) => {
 
     if (oldRoom === roomToJoin) {
       if (profileUpdated) {
+        io.to(roomToJoin).emit('user-profile-updated', {
+          id: socket.id,
+          name: user.name,
+          avatarColor: user.avatarColor,
+          avatarStyle: user.avatarStyle,
+          status: user.status,
+        });
+        io.emit('presence-list', getOfficePresence());
+        if (db.connected) {
+          Session.updateOne(
+            { socketId: socket.id },
+            {
+              $set: {
+                name: user.name,
+                email: user.email,
+                guestId: user.guestId,
+                avatarColor: user.avatarColor,
+                avatarStyle: user.avatarStyle,
+                status: user.status,
+                lastSeen: new Date(),
+              },
+            }
+          ).catch((err) => log('warn', `[DB] Session update failed: ${err.message}`));
+        }
+      }
         io.to(roomToJoin).emit('user-profile-updated', {
           id: socket.id,
           name: user.name,
@@ -524,20 +593,212 @@ io.on('connection', async (socket) => {
 
     log('log', `[ROOM-JOIN] ${user.name} moved from ${oldRoom} to ${roomToJoin}`);
 
-    if (db.connected) {
-      Session.updateOne(
-        { socketId: socket.id },
-        {
-          $set: {
-            room: roomToJoin,
-            x: user.x,
-            y: user.y,
-            lastSeen: new Date(),
-          },
+      if (db.connected) {
+        Session.updateOne(
+          { socketId: socket.id },
+          {
+            $set: {
+              room: roomToJoin,
+              x: user.x,
+              y: user.y,
+              lastSeen: new Date(),
+            },
+          }
+        ).catch((err) => log('warn', `[DB] Session room update failed: ${err.message}`));
+      }
+    });
+
+    // ── Session & Room Reconnection Recovery ──────────────────────────────────
+    socket.on('recover-session', async (data, callback) => {
+      const {
+        previousSocketId,
+        guestId: reqGuestId,
+        profile: recoveryProfile,
+        room: requestedRoom,
+        lastX,
+        lastY,
+        workstation: requestedWorkstation,
+      } = (data && typeof data === 'object') ? data : {};
+
+      log('log', `[SESSION-RECOVER] Request from ${socket.id} (prev: ${previousSocketId}, guest: ${reqGuestId}) for room: ${requestedRoom}`);
+
+      // 1. Sanitize Profile data
+      const activeProfile = recoveryProfile && typeof recoveryProfile === 'object' ? recoveryProfile : {};
+      const cleanName = sanitizeDisplayName(activeProfile.name) || user.name;
+      const cleanEmail = sanitizeEmail(activeProfile.email) || user.email;
+      const avatarColor = (activeProfile.avatarColor && /^#[0-9a-fA-F]{6}$/.test(activeProfile.avatarColor))
+        ? activeProfile.avatarColor
+        : user.avatarColor;
+      const avatarStyle = (activeProfile.avatarStyle && VALID_STYLES.has(activeProfile.avatarStyle))
+        ? activeProfile.avatarStyle
+        : user.avatarStyle;
+      const status = (activeProfile.status && VALID_STATUSES.has(activeProfile.status))
+        ? activeProfile.status
+        : 'online';
+      const resolvedGuestId = (typeof reqGuestId === 'string' && reqGuestId)
+        ? reqGuestId.slice(0, 50)
+        : (user.guestId || null);
+
+      // 2. Clean up any stale/ghost records for this user to prevent duplicate participants
+      if (previousSocketId && previousSocketId !== socket.id && users.has(previousSocketId)) {
+        const staleUser = users.get(previousSocketId);
+        if (staleUser.room) {
+          socket.to(staleUser.room).emit('user-left', previousSocketId);
+          cleanupPrivateRoomIfEmpty(staleUser.room);
         }
-      ).catch((err) => log('warn', `[DB] Session room update failed: ${err.message}`));
-    }
-  });
+        if (staleUser.workstation) {
+          occupiedWorkstations.delete(staleUser.workstation);
+        }
+        users.delete(previousSocketId);
+      }
+      if (resolvedGuestId) {
+        for (const [sId, existingUser] of users.entries()) {
+          if (sId !== socket.id && existingUser.guestId === resolvedGuestId) {
+            log('log', `[SESSION-RECOVER] Removing stale socket ${sId} matching guestId ${resolvedGuestId}`);
+            if (existingUser.room) {
+              socket.to(existingUser.room).emit('user-left', sId);
+              cleanupPrivateRoomIfEmpty(existingUser.room);
+            }
+            if (existingUser.workstation) {
+              occupiedWorkstations.delete(existingUser.workstation);
+            }
+            users.delete(sId);
+          }
+        }
+      }
+
+      // 3. Validate & resolve target room
+      let targetRoom = requestedRoom || 'general';
+      let roomTitle = 'General Office';
+      let isPrivate = false;
+      let hostSocketId = null;
+      let roomFallbackNotice = null;
+
+      if (PUBLIC_ROOMS.includes(targetRoom)) {
+        if (targetRoom === 'meeting')      roomTitle = 'Meeting Room';
+        else if (targetRoom === 'focus')   roomTitle = 'Focus Room';
+        else                               roomTitle = 'General Office';
+      } else if (typeof targetRoom === 'string' && privateRooms.has(targetRoom)) {
+        // Valid active private room
+        const priv = privateRooms.get(targetRoom);
+        roomTitle = priv.title;
+        isPrivate = true;
+        if (priv.hostSocketId === previousSocketId) {
+          priv.hostSocketId = socket.id;
+        }
+        hostSocketId = priv.hostSocketId;
+      } else {
+        // Target private room was expired, closed, or invalid
+        if (targetRoom && targetRoom !== 'general') {
+          roomFallbackNotice = `Previous meeting (${targetRoom}) is no longer available. Reconnected to General Office.`;
+          log('warn', `[SESSION-RECOVER] Room ${targetRoom} no longer available. Falling back to general.`);
+        }
+        targetRoom = 'general';
+        roomTitle = 'General Office';
+        isPrivate = false;
+      }
+
+      // 4. Validate & restore coordinates (authoritative clamp)
+      let posX = Number.isFinite(lastX) ? lastX : user.x;
+      let posY = Number.isFinite(lastY) ? lastY : user.y;
+      const clamped = clampPosition(posX, posY);
+      posX = clamped.x;
+      posY = clamped.y;
+
+      // 5. Validate & restore workstation
+      let restoredWorkstation = null;
+      if (requestedWorkstation && typeof requestedWorkstation === 'string') {
+        const existingDesk = occupiedWorkstations.get(requestedWorkstation);
+        if (!existingDesk || existingDesk.socketId === previousSocketId || existingDesk.userId === previousSocketId) {
+          occupiedWorkstations.set(requestedWorkstation, {
+            socketId: socket.id,
+            userId: socket.id,
+            name: cleanName,
+            deskName: existingDesk?.deskName || requestedWorkstation,
+          });
+          restoredWorkstation = requestedWorkstation;
+        }
+      }
+
+      // 6. Update current user instance in memory
+      user.name = cleanName;
+      user.email = cleanEmail;
+      user.guestId = resolvedGuestId;
+      user.avatarColor = avatarColor;
+      user.avatarStyle = avatarStyle;
+      user.status = status;
+      user.room = targetRoom;
+      user.x = posX;
+      user.y = posY;
+      user.workstation = restoredWorkstation;
+      users.set(socket.id, user);
+
+      // 7. Re-join Socket.IO room
+      for (const r of socket.rooms) {
+        if (r !== socket.id) socket.leave(r);
+      }
+      socket.join(targetRoom);
+
+      // 8. Send fresh room state & workstation occupancy to reconnecting client
+      const currentRoomUsers = Array.from(users.values()).filter((u) => u.room === targetRoom);
+      socket.emit('initial-users', currentRoomUsers);
+      socket.emit('room-info', {
+        room: targetRoom,
+        title: roomTitle,
+        isPrivate,
+        code: isPrivate ? targetRoom : null,
+        hostSocketId,
+      });
+      socket.emit('workstation-occupancy', Object.fromEntries(occupiedWorkstations));
+
+      // 9. Notify other peers in the room
+      socket.to(targetRoom).emit('user-joined', user);
+
+      // 10. Broadcast updated counts & presence globally
+      io.emit('room-counts', getRoomCounts());
+      io.emit('presence-list', getOfficePresence());
+
+      // 11. Update MongoDB Session
+      if (db.connected) {
+        Session.findOneAndUpdate(
+          { $or: [{ socketId: previousSocketId }, { socketId: socket.id }, { guestId: resolvedGuestId }] },
+          {
+            $set: {
+              socketId: socket.id,
+              name: cleanName,
+              email: cleanEmail,
+              guestId: resolvedGuestId,
+              room: targetRoom,
+              x: posX,
+              y: posY,
+              avatarColor,
+              avatarStyle,
+              status,
+              workstation: restoredWorkstation,
+              location: Session.makeLocation(posX, posY),
+              lastSeen: new Date(),
+            },
+          },
+          { upsert: true, new: true }
+        ).catch((err) => log('warn', `[DB] Session recover update failed: ${err.message}`));
+      }
+
+      log('log', `[SESSION-RECOVER] ${user.name} (${socket.id}) successfully restored to ${targetRoom} at (${posX}, ${posY})`);
+
+      if (typeof callback === 'function') {
+        callback({
+          success: true,
+          restored: true,
+          room: targetRoom,
+          title: roomTitle,
+          isPrivate,
+          code: isPrivate ? targetRoom : null,
+          workstation: restoredWorkstation,
+          notice: roomFallbackNotice,
+          user,
+        });
+      }
+    });
 
   socket.on('create-private-room', ({ title }) => {
     const cleanTitle = (title && typeof title === 'string')

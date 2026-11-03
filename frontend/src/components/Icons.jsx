@@ -272,3 +272,28 @@ export function ArrowRightIcon({ size = 16, className = '' }) {
   );
 }
 
+export function RefreshCwIcon({ size = 16, className = '' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <path d="M3 12a9 9 0 0 1 15-6.7L21 8" />
+      <path d="M21 3v5h-5" />
+      <path d="M21 12a9 9 0 0 1-15 6.7L3 16" />
+      <path d="M3 21v-5h5" />
+    </svg>
+  );
+}
+
+export function WifiOffIcon({ size = 16, className = '' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <line x1="2" x2="22" y1="2" y2="22" />
+      <path d="M12 20h.01" />
+      <path d="M8.5 16.429a5 5 0 0 1 7 0" />
+      <path d="M5 12.859a10 10 0 0 1 5.17-2.69" />
+      <path d="M19 12.859a10 10 0 0 0-2.007-1.523" />
+      <path d="M2 8.82a15 15 0 0 1 4.177-2.643" />
+      <path d="M22 8.82a15 15 0 0 0-11.288-3.764" />
+    </svg>
+  );
+}
+
