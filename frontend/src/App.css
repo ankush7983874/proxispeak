@@ -1144,8 +1144,23 @@ body {
   background: rgba(239, 68, 68, 0.08);
   border-color: rgba(239, 68, 68, 0.3);
   color: #dc2626;
-  cursor: not-allowed;
+  cursor: pointer;
   box-shadow: none;
+}
+
+.mic-btn.denied:hover {
+  background: rgba(239, 68, 68, 0.16);
+  border-color: rgba(239, 68, 68, 0.5);
+  transform: translateY(-1px);
+}
+
+.mic-hint.mic-hint-error {
+  color: #b91c1c;
+  background: rgba(239, 68, 68, 0.08);
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  border: 1px solid rgba(239, 68, 68, 0.2);
+  font-weight: 500;
 }
 
 .mic-actions {

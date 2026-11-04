@@ -436,7 +436,7 @@ export default function App() {
 
   // ── Microphone Click Handler ──────────────────────────────────────────────
   const handleMicClick = () => {
-    if (micState === 'idle' || micState === 'error') {
+    if (micState === 'idle' || micState === 'error' || micState === 'denied') {
       requestMic();
     } else if (micState === 'active' || micState === 'muted') {
       toggleMute();
@@ -924,8 +924,8 @@ export default function App() {
                     type="button"
                     className={`mic-btn ${micState === 'muted' ? 'muted' : micState === 'denied' ? 'denied' : ''}`}
                     onClick={handleMicClick}
-                    disabled={micState === 'requesting' || micState === 'denied'}
-                    aria-label={micState === 'active' ? 'Mute microphone' : 'Enable microphone'}
+                    disabled={micState === 'requesting'}
+                    aria-label={micState === 'active' ? 'Mute microphone' : micState === 'denied' ? 'Retry microphone' : 'Enable microphone'}
                   >
                     {micState === 'active' ? (
                       <MicIcon size={16} />
@@ -939,7 +939,7 @@ export default function App() {
                       {micState === 'requesting' && 'Requesting Access…'}
                       {micState === 'active'     && 'Mute Microphone'}
                       {micState === 'muted'      && 'Unmute Microphone'}
-                      {micState === 'denied'     && 'Access Denied'}
+                      {micState === 'denied'     && 'Retry Microphone'}
                       {micState === 'error'      && 'Retry Microphone'}
                     </span>
                   </button>
@@ -974,8 +974,8 @@ export default function App() {
                   </p>
                 )}
                 {micState === 'denied' && (
-                  <p className="mic-hint">
-                    Microphone access was denied. Check your browser privacy permissions and reload.
+                  <p className="mic-hint mic-hint-error">
+                    Microphone access was denied. Allow microphone in your browser settings (lock icon in address bar) and click Retry Microphone.
                   </p>
                 )}
               </div>

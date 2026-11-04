@@ -68,6 +68,18 @@ export function useWebRTC(myId) {
     if (localStreamRef.current) return; // already granted
     setMicState('requesting');
     setWebrtcError(null);
+
+    // Verify browser media devices support and secure context (HTTPS / localhost required)
+    if (!navigator?.mediaDevices?.getUserMedia) {
+      setMicState('error');
+      setWebrtcError(
+        window.isSecureContext === false
+          ? 'Microphone requires a secure context (HTTPS or http://localhost). Insecure network origins are blocked by browser security.'
+          : 'Microphone API (navigator.mediaDevices.getUserMedia) is not supported in this browser.'
+      );
+      return;
+    }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -98,10 +110,33 @@ export function useWebRTC(myId) {
       setMicState('active');
       socket.emit('update-mic-status', { micEnabled: true });
 
-      // If we already have nearby users, add track and initiate connections
+      const audioTrack = stream.getAudioTracks()[0];
+
+      // Attach audio track to all existing peer connections with nearby peers
+      for (const [remoteId, peer] of Object.entries(peersRef.current)) {
+        if (!peer.pc || peer.pc.signalingState === 'closed') continue;
+
+        let needsRenegotiate = false;
+        const senders = typeof peer.pc.getSenders === 'function' ? peer.pc.getSenders() : [];
+        const existingAudioSender = senders.find((s) => s.track?.kind === 'audio' || s.dtmf !== undefined);
+
+        if (existingAudioSender && typeof existingAudioSender.replaceTrack === 'function') {
+          existingAudioSender.replaceTrack(audioTrack).catch(() => {});
+          peer.sender = existingAudioSender;
+        } else if (typeof peer.pc.addTrack === 'function') {
+          peer.sender = peer.pc.addTrack(audioTrack, stream);
+          needsRenegotiate = true;
+        }
+
+        if (needsRenegotiate && myId && myId < remoteId) {
+          initiateOffer(remoteId);
+        }
+      }
+
+      // If we already have nearby users, initiate connections
       if (myId && nearbyUsersRef.current.length > 0) {
         nearbyUsersRef.current.forEach(({ user }) => {
-          if (user.id === myId) return;
+          if (user.id === myId || peersRef.current[user.id]) return;
           const isOfferer = myId < user.id;
           if (isOfferer) {
             initiateOffer(user.id);
@@ -111,10 +146,10 @@ export function useWebRTC(myId) {
     } catch (err) {
       if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
         setMicState('denied');
-        setWebrtcError('Microphone permission denied. Please allow microphone access in your browser settings.');
+        setWebrtcError('Microphone permission denied. Allow microphone in your browser settings (lock icon in address bar) and click Retry.');
       } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
         setMicState('error');
-        setWebrtcError('No microphone hardware detected.');
+        setWebrtcError('No microphone hardware detected on this device.');
       } else {
         setMicState('error');
         setWebrtcError(err.message || 'Unable to access microphone.');
@@ -132,11 +167,13 @@ export function useWebRTC(myId) {
     setWebrtcError(null);
     socket.emit('update-mic-status', { micEnabled: false });
 
-    // Close all current peer connections since we no longer transmit audio
-    Object.keys(peersRef.current).forEach((rid) => {
-      closePeer(rid);
-    });
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    // Silence outgoing audio on all existing peers without destroying incoming audio connections
+    for (const peer of Object.values(peersRef.current)) {
+      if (peer.sender && typeof peer.sender.replaceTrack === 'function') {
+        peer.sender.replaceTrack(null).catch(() => {});
+      }
+    }
+  }, []);
 
   const toggleMute = useCallback(() => {
     const stream = localStreamRef.current;
@@ -155,12 +192,21 @@ export function useWebRTC(myId) {
     if (peersRef.current[remoteId]?.pc) return peersRef.current[remoteId].pc;
 
     const pc = new RTCPeerConnection({ iceServers: iceServersRef.current });
+    let sender = null;
 
     // Add local audio tracks if available
     if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => {
-        pc.addTrack(track, localStreamRef.current);
-      });
+      const audioTrack = localStreamRef.current.getAudioTracks()[0];
+      if (audioTrack) {
+        sender = pc.addTrack(audioTrack, localStreamRef.current);
+      }
+    } else {
+      // If we don't have mic permission yet, add receive-only transceiver so we can receive remote peer's audio
+      try {
+        pc.addTransceiver('audio', { direction: 'recvonly' });
+      } catch {
+        // Fallback for older browsers
+      }
     }
 
     // ICE candidate → signal to remote peer
@@ -171,33 +217,50 @@ export function useWebRTC(myId) {
     };
 
     // Remote audio stream → create GainNode for distance-based volume
-    pc.ontrack = ({ streams }) => {
-      const remoteStream = streams[0];
+    pc.ontrack = ({ streams, track }) => {
+      const remoteStream = streams[0] || new MediaStream([track]);
       if (!remoteStream) return;
 
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+        audioContextRef.current = new AudioContext();
+      }
       const audioCtx = audioContextRef.current;
-      if (!audioCtx) return;
 
       if (audioCtx.state === 'suspended') {
         audioCtx.resume().catch(() => {});
       }
 
+      if (peersRef.current[remoteId]?.gainNode) {
+        try { peersRef.current[remoteId].gainNode.disconnect(); } catch {}
+      }
+
       const source   = audioCtx.createMediaStreamSource(remoteStream);
       const gainNode = audioCtx.createGain();
-      gainNode.gain.value = 0; // start silent; updated by updateVolumes()
+
+      // Set initial volume based on current distance
+      const nearbyEntry = nearbyUsersRef.current.find((n) => n.user.id === remoteId);
+      const initialGain = nearbyEntry ? volumeFromDistance(nearbyEntry.dist) : 0;
+      gainNode.gain.setValueAtTime(initialGain, audioCtx.currentTime);
+
       source.connect(gainNode);
       gainNode.connect(audioCtx.destination);
 
       // Also attach to an audio element as fallback for autoplay compliance
-      const audioEl  = new Audio();
+      let audioEl = peersRef.current[remoteId]?.audioEl;
+      if (!audioEl) {
+        audioEl = new Audio();
+        audioEl.muted = true; // muted because audio is routed through Web Audio GainNode
+      }
       audioEl.srcObject = remoteStream;
-      audioEl.muted  = true; // muted because audio is routed through Web Audio GainNode
       audioEl.play().catch(() => {});
 
       peersRef.current[remoteId] = {
         ...peersRef.current[remoteId],
+        pc,
         gainNode,
         audioEl,
+        sender: peersRef.current[remoteId]?.sender || sender,
       };
       setAudioConnections((n) => n + 1);
     };
@@ -222,7 +285,7 @@ export function useWebRTC(myId) {
       }
     };
 
-    peersRef.current[remoteId] = { pc, gainNode: null, audioEl: null, retryCount: 0 };
+    peersRef.current[remoteId] = { pc, gainNode: null, audioEl: null, retryCount: 0, sender };
     return pc;
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -268,30 +331,34 @@ export function useWebRTC(myId) {
     nearbyUsersRef.current = nearbyUsers;
     const nearbyIds = new Set(nearbyUsers.map((n) => n.user.id));
 
-    // Close connections for users who moved out of earshot
+    // Close connections for users who moved out of earshot (>100px)
     Object.keys(peersRef.current).forEach((rid) => {
-      if (!nearbyIds.has(rid)) closePeer(rid);
+      if (!nearbyIds.has(rid)) {
+        closePeer(rid);
+      }
     });
 
-    // Set gain for users in earshot
+    // Set gain for users within earshot
     nearbyUsers.forEach(({ user, dist }) => {
       const peer = peersRef.current[user.id];
       if (peer?.gainNode && audioContextRef.current) {
         const gain = volumeFromDistance(dist);
-        peer.gainNode.gain.setTargetAtTime(gain, audioContextRef.current.currentTime, 0.1);
+        peer.gainNode.gain.setTargetAtTime(gain, audioContextRef.current.currentTime, 0.05);
       }
     });
 
-    // Initiate connections to newly nearby users (if mic is active)
-    if (localStreamRef.current && myId) {
+    // Initiate connections to newly nearby users (deterministic offerer selection)
+    if (myId) {
       nearbyUsers.forEach(({ user }) => {
         if (user.id === myId || peersRef.current[user.id]) return;
-        const isOfferer = myId < user.id; // deterministic offerer selection
-        if (isOfferer) initiateOffer(user.id);
+        const isOfferer = myId < user.id;
+        if (isOfferer) {
+          initiateOffer(user.id);
+        }
       });
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [myId]);
+  }, [myId, closePeer]);
 
   const initiateOffer = async (remoteId) => {
     const pc = createPeer(remoteId);

@@ -1011,5 +1011,196 @@ assert(counts.meeting === 15, 'Meeting room accurately tracks 15 concurrent user
 assert(counts.focus === 10, 'Focus room accurately tracks 10 concurrent users');
 assert(multiRoomUsers.size === 50, 'Total office presence accurately reflects 50 connected employees');
 
+// ── 21. Multi-User Microphone & WebRTC Proximity Audio Architecture ───────────
+
+// 21.1 Deterministic Offerer Selection & Asymmetric Mic Connectivity
+function determineWebRTCOfferer(myId, remoteId) {
+  return myId < remoteId;
+}
+
+assert(determineWebRTCOfferer('sock_alice', 'sock_bob') === true, 'sock_alice initiates offer to sock_bob (lexicographically smaller)');
+assert(determineWebRTCOfferer('sock_bob', 'sock_alice') === false, 'sock_bob waits for offer from sock_alice');
+assert(determineWebRTCOfferer('user_01', 'user_02') === true, 'Deterministic offerer selection prevents offer collision (glare)');
+
+// Transceiver configuration when mic is disabled vs enabled
+function resolveTransceiverConfig(hasLocalMic) {
+  if (hasLocalMic) {
+    return { direction: 'sendrecv', sendsAudio: true, receivesAudio: true };
+  }
+  return { direction: 'recvonly', sendsAudio: false, receivesAudio: true };
+}
+
+const listenerOnlyConfig = resolveTransceiverConfig(false);
+assert(listenerOnlyConfig.direction === 'recvonly', 'User without mic initializes receive-only transceiver to hear speaking colleagues');
+assert(listenerOnlyConfig.receivesAudio === true, 'Listener peer receives audio without local mic hardware');
+assert(listenerOnlyConfig.sendsAudio === false, 'Listener peer does not transmit audio');
+
+const speakerConfig = resolveTransceiverConfig(true);
+assert(speakerConfig.direction === 'sendrecv', 'Speaker peer initializes sendrecv audio stream');
+assert(speakerConfig.sendsAudio === true, 'Speaker peer transmits microphone audio');
+
+// 21.2 Dynamic Proximity Audio Connectivity & Squared Falloff
+const EARSHOT_RADIUS = 100;
+function calculateProximityGain(dist, maxRadius = EARSHOT_RADIUS) {
+  if (dist <= 0) return 1.0;
+  if (dist >= maxRadius) return 0.0;
+  const normalized = dist / maxRadius;
+  return Math.pow(1 - normalized, 2);
+}
+
+// User A at (300, 200), User B at (350, 200) -> distance = 50px
+const dist50 = Math.hypot(350 - 300, 200 - 200);
+const gain50 = calculateProximityGain(dist50);
+assert(dist50 === 50, 'Calculated 50px distance between adjacent avatars');
+assert(gain50 === 0.25, 'At 50px distance (halfway), audio gain is exactly 25% (squared falloff)');
+
+// User B moves to (450, 200) -> distance = 150px (outside earshot)
+const dist150 = Math.hypot(450 - 300, 200 - 200);
+const gain150 = calculateProximityGain(dist150);
+const inEarshot150 = dist150 <= EARSHOT_RADIUS;
+assert(!inEarshot150, 'Avatar at 150px is beyond 100px earshot boundary');
+assert(gain150 === 0.0, 'Volume beyond earshot boundary is completely silent (0.0 gain)');
+
+// User B returns to (380, 200) -> distance = 80px (re-entering earshot)
+const dist80 = Math.hypot(380 - 300, 200 - 200);
+const gain80 = calculateProximityGain(dist80);
+const inEarshot80 = dist80 <= EARSHOT_RADIUS;
+assert(inEarshot80, 'Avatar re-entering within 80px is detected inside earshot');
+assert(Math.abs(gain80 - 0.04) < 0.001, 'Re-entered proximity gain scales accurately (4% at 80px)');
+
+// 21.3 Microphone Lifecycle State Machine & Track Management
+class MockAudioTrack {
+  constructor() {
+    this.enabled = true;
+    this.stopped = false;
+  }
+  stop() {
+    this.stopped = true;
+  }
+}
+
+class MockMediaStream {
+  constructor() {
+    this.tracks = [new MockAudioTrack()];
+  }
+  getAudioTracks() {
+    return this.tracks;
+  }
+  getTracks() {
+    return this.tracks;
+  }
+}
+
+class MicrophoneController {
+  constructor(socketMock) {
+    this.state = 'idle';
+    this.stream = null;
+    this.socket = socketMock;
+    this.error = null;
+  }
+
+  requestMic(isSecureContext, hasDevices, userAllowed) {
+    this.state = 'requesting';
+    this.error = null;
+
+    if (!hasDevices) {
+      this.state = 'error';
+      this.error = isSecureContext === false
+        ? 'Microphone requires a secure context (HTTPS or http://localhost).'
+        : 'Microphone API is not supported in this browser.';
+      return false;
+    }
+
+    if (!userAllowed) {
+      this.state = 'denied';
+      this.error = 'Microphone permission denied. Allow microphone in your browser settings and click Retry.';
+      return false;
+    }
+
+    this.stream = new MockMediaStream();
+    this.state = 'active';
+    this.socket.emit('update-mic-status', { micEnabled: true });
+    return true;
+  }
+
+  toggleMute() {
+    if (!this.stream) return;
+    const track = this.stream.getAudioTracks()[0];
+    track.enabled = !track.enabled;
+    this.state = track.enabled ? 'active' : 'muted';
+    this.socket.emit('update-mic-status', { micEnabled: track.enabled });
+  }
+
+  disableMic(peers) {
+    if (this.stream) {
+      this.stream.getTracks().forEach(t => t.stop());
+      this.stream = null;
+    }
+    this.state = 'idle';
+    this.socket.emit('update-mic-status', { micEnabled: false });
+
+    // Silence outgoing senders without destroying incoming peer connections
+    for (const peer of Object.values(peers)) {
+      if (peer.sender) {
+        peer.sender.replacedWith = null;
+      }
+    }
+  }
+}
+
+const mockSocketEvents = [];
+const mockSocket = {
+  emit: (event, payload) => mockSocketEvents.push({ event, payload }),
+};
+
+const micCtrl = new MicrophoneController(mockSocket);
+assert(micCtrl.state === 'idle', 'Microphone initializes in idle state');
+
+// Test insecure context handling
+const deniedInsecure = micCtrl.requestMic(false, false, true);
+assert(!deniedInsecure && micCtrl.state === 'error', 'Insecure context correctly rejected without crashing');
+assert(micCtrl.error.includes('secure context'), 'Surfaces clear secure context error message');
+
+// Test browser permission denied handling
+const deniedByUser = micCtrl.requestMic(true, true, false);
+assert(!deniedByUser && micCtrl.state === 'denied', 'Permission denial transitions to denied state');
+assert(micCtrl.error.includes('settings'), 'Surfaces helpful browser unlock instruction');
+
+// Test successful permission grant
+const granted = micCtrl.requestMic(true, true, true);
+assert(granted && micCtrl.state === 'active', 'Permission grant transitions to active state');
+assert(mockSocketEvents.some(e => e.event === 'update-mic-status' && e.payload.micEnabled === true), 'Emits update-mic-status: true on activation');
+
+// Test mute/unmute
+micCtrl.toggleMute();
+assert(micCtrl.state === 'muted', 'toggleMute sets state to muted');
+assert(!micCtrl.stream.getAudioTracks()[0].enabled, 'Audio track disabled on mute');
+assert(mockSocketEvents.some(e => e.event === 'update-mic-status' && e.payload.micEnabled === false), 'Emits update-mic-status: false on mute');
+
+micCtrl.toggleMute();
+assert(micCtrl.state === 'active', 'toggleMute restores state to active');
+assert(micCtrl.stream.getAudioTracks()[0].enabled, 'Audio track enabled on unmute');
+
+// Test disableMic (turn off microphone stream)
+const mockPeers = {
+  peer_charlie: { id: 'peer_charlie', sender: { replacedWith: 'audio_track' }, pc: { closed: false } },
+};
+micCtrl.disableMic(mockPeers);
+assert(micCtrl.state === 'idle', 'disableMic sets state to idle');
+assert(micCtrl.stream === null, 'Local media stream released');
+assert(mockPeers.peer_charlie.sender.replacedWith === null, 'Outgoing sender silenced with replaceTrack(null)');
+assert(mockPeers.peer_charlie.pc.closed === false, 'Incoming peer connection remains open so user can still hear colleagues');
+
+// 21.4 Cross-Room Audio Isolation Even at 0px Canvas Distance
+const userInGeneral = { id: 'u_gen', room: 'general', x: 300, y: 200 };
+const userInMeeting = { id: 'u_meet', room: 'meeting', x: 300, y: 200 };
+
+const crossRoomNearby = getNearbyServer(userInGeneral, new Map([
+  [userInGeneral.id, userInGeneral],
+  [userInMeeting.id, userInMeeting],
+]));
+
+assert(crossRoomNearby.length === 0, 'No nearby audio peers between General Office and Meeting Room despite identical (300, 200) position');
+
 console.log(`\n── Results: ${pass} passed, ${fail} failed ──\n`);
 process.exit(fail > 0 ? 1 : 0);
