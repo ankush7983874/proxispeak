@@ -16,9 +16,15 @@ import {
   checkCollision,
   findNearbyWorkstation,
   getCurrentZone,
+  getRoomObstacles,
 } from './hooks/useOfficeCanvas.js';
 import { useWebRTC }       from './hooks/useWebRTC.js';
-import { getNearbyUsers, EARSHOT_RADIUS, volumeFromDistance } from './utils/proximity.js';
+import {
+  getNearbyUsers,
+  EARSHOT_RADIUS,
+  volumeFromDistance,
+  calculateAudioObstruction,
+} from './utils/proximity.js';
 import { WelcomePage }     from './components/WelcomePage.jsx';
 import { PresencePanel }   from './components/PresencePanel.jsx';
 import { OfficeMinimap }   from './components/OfficeMinimap.jsx';
@@ -431,8 +437,10 @@ export default function App() {
     const others = users.filter((u) => u.id !== myId);
     const nearby = getNearbyUsers(me, others, EARSHOT_RADIUS);
     setNearbyUsers(nearby);
-    updateVolumes(nearby, users);
-  }, [users, myId, updateVolumes]);
+
+    const obstacles = getRoomObstacles(currentRoom, roomInfo?.isPrivate);
+    updateVolumes(nearby, me, obstacles);
+  }, [users, myId, currentRoom, roomInfo?.isPrivate, updateVolumes]);
 
   // ── Microphone Click Handler ──────────────────────────────────────────────
   const handleMicClick = () => {
@@ -1032,6 +1040,8 @@ export default function App() {
                     currentRoom={currentRoom}
                     nearbyUsers={nearbyUsers}
                     onJoinRoom={(targetRoom) => joinRoom(targetRoom)}
+                    me={users.find((u) => u.id === myId)}
+                    obstacles={getRoomObstacles(currentRoom, roomInfo?.isPrivate)}
                   />
                 ) : sidebarTab === 'teammates' ? (
                   <div className="nearby-list" aria-live="polite" aria-label="Connected room participants">
@@ -1088,11 +1098,27 @@ export default function App() {
                                 <span style={{ color: 'var(--text-muted)' }}><MicOffIcon size={13} /></span>
                               )}
                             </span>
-                            {nearbyInfo ? (
-                              <span className="nearby-vol" title="Proximity volume">
-                                {Math.round(volumeFromDistance(nearbyInfo.dist) * 100)}%
-                              </span>
-                            ) : !isMe ? (
+                            {nearbyInfo ? (() => {
+                              const meUser = users.find((userObj) => userObj.id === myId);
+                              const roomObstacles = getRoomObstacles(currentRoom, roomInfo?.isPrivate);
+                              let transmission = 1.0;
+                              let blockedBy = [];
+                              if (meUser && roomObstacles && roomObstacles.length > 0) {
+                                const obs = calculateAudioObstruction(meUser, u, roomObstacles);
+                                transmission = obs.transmission;
+                                blockedBy = obs.blockedBy;
+                              }
+                              const finalPct = Math.round(volumeFromDistance(nearbyInfo.dist) * transmission * 100);
+                              const isObstructed = blockedBy.length > 0;
+                              return (
+                                <span
+                                  className={`nearby-vol ${isObstructed ? 'obstructed' : ''}`}
+                                  title={isObstructed ? `Proximity volume: ${finalPct}% (obstructed by ${blockedBy.join(', ')})` : `Proximity volume: ${finalPct}%`}
+                                >
+                                  {finalPct}%{isObstructed ? ' 🧱' : ''}
+                                </span>
+                              );
+                            })() : !isMe ? (
                               <span className="nearby-dist" title="Beyond earshot radius">Far</span>
                             ) : null}
                           </div>

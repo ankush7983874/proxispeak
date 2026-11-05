@@ -17,7 +17,7 @@
  *   Add TURN URLs + credentials via environment variables — NEVER hardcode.
  */
 import { useEffect, useRef, useCallback, useState } from 'react';
-import { volumeFromDistance } from '../utils/proximity.js';
+import { volumeFromDistance, EARSHOT_RADIUS, calculateAudioObstruction } from '../utils/proximity.js';
 import socket from '../services/socket.js';
 
 // STUN / TURN configuration — loaded from Vite env or fallback to public STUN
@@ -234,8 +234,16 @@ export function useWebRTC(myId) {
       if (peersRef.current[remoteId]?.gainNode) {
         try { peersRef.current[remoteId].gainNode.disconnect(); } catch {}
       }
+      if (peersRef.current[remoteId]?.pannerNode) {
+        try { peersRef.current[remoteId].pannerNode.disconnect(); } catch {}
+      }
 
       const source   = audioCtx.createMediaStreamSource(remoteStream);
+      let pannerNode = null;
+      if (typeof audioCtx.createStereoPanner === 'function') {
+        pannerNode = audioCtx.createStereoPanner();
+        pannerNode.pan.setValueAtTime(0, audioCtx.currentTime);
+      }
       const gainNode = audioCtx.createGain();
 
       // Set initial volume based on current distance
@@ -243,7 +251,12 @@ export function useWebRTC(myId) {
       const initialGain = nearbyEntry ? volumeFromDistance(nearbyEntry.dist) : 0;
       gainNode.gain.setValueAtTime(initialGain, audioCtx.currentTime);
 
-      source.connect(gainNode);
+      if (pannerNode) {
+        source.connect(pannerNode);
+        pannerNode.connect(gainNode);
+      } else {
+        source.connect(gainNode);
+      }
       gainNode.connect(audioCtx.destination);
 
       // Also attach to an audio element as fallback for autoplay compliance
@@ -258,6 +271,7 @@ export function useWebRTC(myId) {
       peersRef.current[remoteId] = {
         ...peersRef.current[remoteId],
         pc,
+        pannerNode,
         gainNode,
         audioEl,
         sender: peersRef.current[remoteId]?.sender || sender,
@@ -285,7 +299,7 @@ export function useWebRTC(myId) {
       }
     };
 
-    peersRef.current[remoteId] = { pc, gainNode: null, audioEl: null, retryCount: 0, sender };
+    peersRef.current[remoteId] = { pc, pannerNode: null, gainNode: null, audioEl: null, retryCount: 0, sender };
     return pc;
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -297,6 +311,13 @@ export function useWebRTC(myId) {
       peer.pc.close();
     } catch {
       // ignore already closed
+    }
+    if (peer.pannerNode) {
+      try {
+        peer.pannerNode.disconnect();
+      } catch {
+        // ignore already disconnected
+      }
     }
     if (peer.gainNode) {
       try {
@@ -321,13 +342,15 @@ export function useWebRTC(myId) {
     setAudioConnections(0);
   }, [closePeer]);
 
-  // ── Volume attenuation ─────────────────────────────────────────────────────
+  // ── Spatial Audio & Volume Attenuation ─────────────────────────────────────
 
   /**
-   * Called by App.jsx whenever positions change.
+   * Called by App.jsx whenever positions or rooms change.
    * nearbyUsers: Array<{ user: object, dist: number }>
+   * me: { x: number, y: number, id: string }
+   * obstacles: Array<{ x, y, w, h, soundAbsorption, ... }>
    */
-  const updateVolumes = useCallback((nearbyUsers) => {
+  const updateVolumes = useCallback((nearbyUsers, me = null, obstacles = []) => {
     nearbyUsersRef.current = nearbyUsers;
     const nearbyIds = new Set(nearbyUsers.map((n) => n.user.id));
 
@@ -338,12 +361,30 @@ export function useWebRTC(myId) {
       }
     });
 
-    // Set gain for users within earshot
+    // Update spatial panning and attenuated gain for users within earshot
     nearbyUsers.forEach(({ user, dist }) => {
       const peer = peersRef.current[user.id];
-      if (peer?.gainNode && audioContextRef.current) {
-        const gain = volumeFromDistance(dist);
-        peer.gainNode.gain.setTargetAtTime(gain, audioContextRef.current.currentTime, 0.05);
+      if (audioContextRef.current) {
+        const currentTime = audioContextRef.current.currentTime;
+
+        // 1. Stereo Panning (relative left/right avatar positioning)
+        if (peer?.pannerNode && me && typeof user.x === 'number' && typeof me.x === 'number') {
+          const dx = user.x - me.x;
+          const pan = Math.max(-1, Math.min(1, dx / EARSHOT_RADIUS));
+          peer.pannerNode.pan.setTargetAtTime(pan, currentTime, 0.05);
+        }
+
+        // 2. Distance-based volume falloff + physical obstacle acoustic obstruction
+        if (peer?.gainNode) {
+          const distanceGain = volumeFromDistance(dist, EARSHOT_RADIUS);
+          let obstructionMultiplier = 1.0;
+          if (me && Array.isArray(obstacles) && obstacles.length > 0) {
+            const { transmission } = calculateAudioObstruction(me, user, obstacles);
+            obstructionMultiplier = transmission;
+          }
+          const finalGain = Math.max(0, Math.min(1, distanceGain * obstructionMultiplier));
+          peer.gainNode.gain.setTargetAtTime(finalGain, currentTime, 0.05);
+        }
       }
     });
 

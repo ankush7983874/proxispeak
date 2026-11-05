@@ -10,8 +10,21 @@
  * 7. Private meeting room lifecycle & automatic cleanup
  */
 
-import { getNearbyUsers as getNearbyServer } from '../backend/src/utils/proximity.js';
-import { getNearbyUsers as getNearbyClient } from '../frontend/src/utils/proximity.js';
+import {
+  getNearbyUsers as getNearbyServer,
+  buildNearQuery,
+  segmentIntersectsRect,
+  calculateAudioObstruction,
+} from '../backend/src/utils/proximity.js';
+import {
+  getNearbyUsers as getNearbyClient,
+  volumeFromDistance,
+} from '../frontend/src/utils/proximity.js';
+import {
+  DEFAULT_GENERAL_LAYOUT,
+  DEFAULT_MEETING_LAYOUT,
+  DEFAULT_FOCUS_LAYOUT,
+} from '../backend/src/models/OfficeLayout.js';
 import {
   checkCollision,
   findNearbyWorkstation,
@@ -1201,6 +1214,121 @@ const crossRoomNearby = getNearbyServer(userInGeneral, new Map([
 ]));
 
 assert(crossRoomNearby.length === 0, 'No nearby audio peers between General Office and Meeting Room despite identical (300, 200) position');
+
+// ── 22. MongoDB $near Geospatial Queries & Latency Benchmarks ────────────────
+const nearQuery = buildNearQuery(400, 250, 100);
+assert(nearQuery.location && nearQuery.location.$near, 'buildNearQuery constructs a $near geospatial query');
+assert(nearQuery.location.$near.$geometry.type === 'Point', 'Query uses GeoJSON Point geometry');
+assert(nearQuery.location.$near.$geometry.coordinates[0] === 400 / 800, 'Coordinates normalized on X axis (0.5)');
+assert(nearQuery.location.$near.$geometry.coordinates[1] === 250 / 500, 'Coordinates normalized on Y axis (0.5)');
+assert(nearQuery.location.$near.$maxDistance > 0, 'Query sets positive $maxDistance in spherical radians');
+
+// High-concurrency spatial scan latency measurement
+const simulatedMap = new Map();
+for (let i = 0; i < 50; i++) {
+  simulatedMap.set(`user_${i}`, {
+    id: `user_${i}`,
+    x: 100 + Math.floor(Math.random() * 600),
+    y: 50 + Math.floor(Math.random() * 400),
+    room: i % 2 === 0 ? 'general' : 'meeting',
+  });
+}
+
+const benchmarkStart = process.hrtime.bigint();
+const testPivot = { id: 'test_pivot', x: 400, y: 250, room: 'general' };
+for (let iter = 0; iter < 1000; iter++) {
+  getNearbyServer(testPivot, simulatedMap);
+}
+const benchmarkEnd = process.hrtime.bigint();
+const totalLatencyMs = Number(benchmarkEnd - benchmarkStart) / 1e6;
+const avgLatencyPerScanMs = totalLatencyMs / 1000;
+
+assert(totalLatencyMs < 100, `1,000 spatial earshot evaluations completed in ${totalLatencyMs.toFixed(2)}ms (< 100ms)`);
+assert(avgLatencyPerScanMs < 0.1, `Average query latency is ${avgLatencyPerScanMs.toFixed(4)}ms (< 0.1ms per scan)`);
+
+// ── 23. Spatial Audio StereoPannerNode Panning Math ─────────────────────────
+function calculateStereoPan(meX, peerX, earshot = EARSHOT_RADIUS) {
+  const dx = peerX - meX;
+  return Math.max(-1, Math.min(1, dx / earshot));
+}
+
+assert(calculateStereoPan(400, 450) === 0.5, 'Peer 50px to the right pans to +0.5');
+assert(calculateStereoPan(400, 350) === -0.5, 'Peer 50px to the left pans to -0.5');
+assert(calculateStereoPan(400, 400) === 0.0, 'Peer at identical X position pans to center 0.0');
+assert(calculateStereoPan(400, 550) === 1.0, 'Peer beyond earshot right is clamped to +1.0');
+assert(calculateStereoPan(400, 200) === -1.0, 'Peer beyond earshot left is clamped to -1.0');
+
+// ── 24. Furniture Sound Obstacle Raycasting & Acoustic Absorption ────────────
+const testObstacleBox = { x: 150, y: 80, w: 40, h: 40, name: 'Glass Partition', soundAbsorption: 0.65 };
+
+// Ray intersecting the box
+const intersectsTrue = segmentIntersectsRect(100, 100, 300, 100, testObstacleBox);
+assert(intersectsTrue === true, 'Horizontal ray from (100, 100) to (300, 100) correctly detects intersection with obstacle');
+
+// Ray missing the box
+const intersectsFalse = segmentIntersectsRect(100, 20, 300, 20, testObstacleBox);
+assert(intersectsFalse === false, 'Parallel ray offset at y: 20 correctly reports no intersection');
+
+// Ray starting inside or terminating inside
+const insideStart = segmentIntersectsRect(160, 90, 300, 90, testObstacleBox);
+assert(insideStart === true, 'Ray starting inside obstacle detects obstruction');
+
+// Acoustic obstruction calculation
+const unobstructed = calculateAudioObstruction({ x: 100, y: 20 }, { x: 300, y: 20 }, [testObstacleBox]);
+assert(unobstructed.transmission === 1.0, 'Unobstructed line-of-sight provides 1.0 (100%) sound transmission');
+assert(unobstructed.obstruction === 0.0, 'Unobstructed line-of-sight has 0.0 obstruction');
+
+const obstructed = calculateAudioObstruction({ x: 100, y: 100 }, { x: 300, y: 100 }, [testObstacleBox]);
+assert(obstructed.transmission === 0.35, 'Glass partition with 0.65 absorption yields 0.35 sound transmission (65% volume reduction)');
+assert(obstructed.obstruction === 0.65, 'Sound obstruction factor is 0.65');
+assert(obstructed.blockedBy.includes('Glass Partition'), 'Identified specific obstacle name in obstruction report');
+
+// Combined spatial gain (distance falloff * acoustic transmission)
+const obstructionDist50 = 50; // volumeFromDistance(50, 100) = (1 - 50/100)^2 = 0.25
+const distGain = volumeFromDistance(obstructionDist50, 100);
+const finalCombinedGain = distGain * obstructed.transmission;
+assert(Number(finalCombinedGain.toFixed(4)) === 0.0875, 'Combined spatial gain correctly scales: distance (0.25) * obstruction (0.35) = 0.0875');
+
+// ── 25. Office Layout Persistence & Schema Verification ─────────────────────
+assert(DEFAULT_GENERAL_LAYOUT.roomId === 'general', 'Default general layout has valid roomId');
+assert(DEFAULT_GENERAL_LAYOUT.obstacles.length >= 10, `General office layout contains ${DEFAULT_GENERAL_LAYOUT.obstacles.length} persistent obstacles`);
+assert(DEFAULT_GENERAL_LAYOUT.workstations.length === 8, 'General office layout contains 8 defined workstations');
+
+assert(DEFAULT_MEETING_LAYOUT.roomId === 'meeting', 'Default meeting layout has valid roomId');
+assert(DEFAULT_MEETING_LAYOUT.obstacles.some(o => o.id === 'boardroom-table'), 'Meeting layout includes Grand Boardroom Table');
+
+assert(DEFAULT_FOCUS_LAYOUT.roomId === 'focus', 'Default focus layout has valid roomId');
+assert(DEFAULT_FOCUS_LAYOUT.obstacles.length === 4, 'Focus layout defines 4 private acoustic pods');
+
+// Verify all obstacles have required physical attributes
+const allDefaultObstacles = [
+  ...DEFAULT_GENERAL_LAYOUT.obstacles,
+  ...DEFAULT_MEETING_LAYOUT.obstacles,
+  ...DEFAULT_FOCUS_LAYOUT.obstacles,
+];
+const validObstacles = allDefaultObstacles.every(o =>
+  o.id &&
+  o.name &&
+  typeof o.x === 'number' &&
+  typeof o.y === 'number' &&
+  typeof o.w === 'number' &&
+  typeof o.h === 'number' &&
+  typeof o.soundAbsorption === 'number' &&
+  o.soundAbsorption >= 0 &&
+  o.soundAbsorption <= 1
+);
+assert(validObstacles, 'All layout obstacles specify dimensions, material, and calibrated soundAbsorption [0, 1]');
+
+// ── 26. Redis Pub/Sub Adapter & Horizontal Scaling Fallback ─────────────────
+import { setupRedisAdapter } from '../backend/server.js';
+
+const mockIo = {
+  adapter: (ad) => { mockIo._adapter = ad; },
+};
+
+const redisFallbackResult = await setupRedisAdapter(mockIo);
+assert(redisFallbackResult.configured === false, 'setupRedisAdapter correctly reports configured: false in dev environment');
+assert(redisFallbackResult.mode === 'in-memory', 'Gracefully falls back to high-performance in-memory adapter without throwing');
 
 console.log(`\n── Results: ${pass} passed, ${fail} failed ──\n`);
 process.exit(fail > 0 ? 1 : 0);

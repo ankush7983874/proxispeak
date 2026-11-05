@@ -767,7 +767,25 @@ export function useOfficeCanvas(
     let frameId;
     let pulseAngle = 0;
 
+    // Real-time FPS & frame-time profiling probe
+    let lastFrameTime = performance.now();
+    let fpsHistory = [];
+    let currentFps = 60;
+    let frameDelta = 16.6;
+
     function draw() {
+      const now = performance.now();
+      const delta = now - lastFrameTime;
+      lastFrameTime = now;
+
+      if (delta > 0 && delta < 500) {
+        fpsHistory.push(1000 / delta);
+        if (fpsHistory.length > 30) fpsHistory.shift();
+        const avg = fpsHistory.reduce((a, b) => a + b, 0) / fpsHistory.length;
+        currentFps = Math.min(60, Math.round(avg));
+        frameDelta = Number(delta.toFixed(1));
+      }
+
       ctx.clearRect(0, 0, LOGICAL_W, LOGICAL_H);
       pulseAngle = (pulseAngle + 0.04) % (Math.PI * 2);
 
@@ -1068,6 +1086,31 @@ export function useOfficeCanvas(
 
         ctx.restore();
       });
+
+      // ── 7. Performance FPS & Render Diagnostics Probe ────────────
+      ctx.save();
+      ctx.font = '600 9.5px ui-monospace, SFMono-Regular, Menlo, monospace';
+      const perfText = `${currentFps} FPS • ${frameDelta}ms`;
+      const perfW = ctx.measureText(perfText).width;
+      const px = LOGICAL_W - perfW - 22;
+      const py = LOGICAL_H - 24;
+
+      // Dark translucent pill
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.72)';
+      roundRect(ctx, px - 8, py - 3, perfW + 16, 18, 5);
+      ctx.fill();
+
+      // Green dot if >= 55 FPS, yellow if >= 30, red if < 30
+      ctx.beginPath();
+      ctx.arc(px - 1, py + 6, 3, 0, Math.PI * 2);
+      ctx.fillStyle = currentFps >= 50 ? '#10b981' : (currentFps >= 30 ? '#f59e0b' : '#ef4444');
+      ctx.fill();
+
+      ctx.fillStyle = '#f8fafc';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(perfText, px + 6, py + 6);
+      ctx.restore();
 
       frameId = requestAnimationFrame(draw);
     }

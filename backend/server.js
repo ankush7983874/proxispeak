@@ -37,7 +37,22 @@ import { Server } from 'socket.io';
 
 import { connectDB, getDBStatus, disconnectDB } from './src/config/db.js';
 import { Session }                               from './src/models/Session.js';
-import { clampPosition, getNearbyUsers, EARSHOT_PIXELS } from './src/utils/proximity.js';
+import { clampPosition, getNearbyUsers, EARSHOT_PIXELS, buildNearQuery } from './src/utils/proximity.js';
+import { createAdapter }                         from '@socket.io/redis-adapter';
+import Redis                                     from 'ioredis';
+import {
+  OfficeLayout,
+  DEFAULT_GENERAL_LAYOUT,
+  DEFAULT_MEETING_LAYOUT,
+  DEFAULT_FOCUS_LAYOUT,
+} from './src/models/OfficeLayout.js';
+
+// Default layout configurations
+export const DEFAULT_LAYOUTS = {
+  general: DEFAULT_GENERAL_LAYOUT,
+  meeting: DEFAULT_MEETING_LAYOUT,
+  focus: DEFAULT_FOCUS_LAYOUT,
+};
 
 // ── Config ──────────────────────────────────────────────────────────────────
 const PORT         = parseInt(process.env.PORT  || '5000', 10);
@@ -63,6 +78,62 @@ function buildIceServers() {
     });
   }
   return servers;
+}
+
+// ── Optional Redis Adapter Setup (Multi-instance Scaling) ────────────────────
+const REDIS_URL      = process.env.REDIS_URL      || '';
+const REDIS_HOST     = process.env.REDIS_HOST     || '';
+const REDIS_PORT     = parseInt(process.env.REDIS_PORT || '6379', 10);
+const REDIS_PASSWORD = process.env.REDIS_PASSWORD || undefined;
+
+let redisAdapterConfigured = false;
+
+export async function setupRedisAdapter(ioInstance = io) {
+  if (!REDIS_URL && !REDIS_HOST) {
+    log('log', '[REDIS] No Redis configuration found; running with default in-memory adapter.');
+    return { configured: false, mode: 'in-memory' };
+  }
+
+  try {
+    const pubClient = REDIS_URL
+      ? new Redis(REDIS_URL, { maxRetriesPerRequest: 1, enableOfflineQueue: false, connectTimeout: 3000 })
+      : new Redis({ host: REDIS_HOST, port: REDIS_PORT, password: REDIS_PASSWORD, maxRetriesPerRequest: 1, enableOfflineQueue: false, connectTimeout: 3000 });
+
+    const subClient = pubClient.duplicate();
+
+    pubClient.on('error', (err) => {
+      log('warn', `[REDIS] PubClient error: ${err.message}`);
+    });
+    subClient.on('error', (err) => {
+      log('warn', `[REDIS] SubClient error: ${err.message}`);
+    });
+
+    await pubClient.ping();
+    ioInstance.adapter(createAdapter(pubClient, subClient));
+    redisAdapterConfigured = true;
+    log('log', '[REDIS] Connected to Redis cluster pub/sub adapter.');
+    return { configured: true, mode: 'redis' };
+  } catch (err) {
+    log('warn', `[REDIS] Could not connect to Redis: ${err.message}. Running with in-memory adapter.`);
+    return { configured: false, mode: 'in-memory-fallback', error: err.message };
+  }
+}
+
+// ── Default Layout Seeder ───────────────────────────────────────────────────
+export async function seedDefaultLayouts() {
+  const db = getDBStatus();
+  if (!db.connected) return;
+  try {
+    for (const [roomId, defaultLayout] of Object.entries(DEFAULT_LAYOUTS)) {
+      const exists = await OfficeLayout.findOne({ roomId });
+      if (!exists) {
+        await OfficeLayout.create(defaultLayout);
+        log('log', `[LAYOUT] Seeded default layout for room '${roomId}'`);
+      }
+    }
+  } catch (err) {
+    log('warn', `[LAYOUT] Seeding error: ${err.message}`);
+  }
 }
 
 // ── Express setup ────────────────────────────────────────────────────────────
@@ -207,6 +278,10 @@ app.get('/api/health', (_req, res) => {
     rooms: getRoomCounts(),
     activePrivateRooms: privateRooms.size,
     database: getDBStatus(),
+    redis: {
+      configured: redisAdapterConfigured,
+      mode: redisAdapterConfigured ? 'redis' : 'in-memory',
+    },
     timestamp: new Date().toISOString(),
   });
 });
@@ -218,6 +293,92 @@ app.get('/api/presence', (_req, res) => {
     presence: getOfficePresence(),
     timestamp: new Date().toISOString(),
   });
+});
+
+/**
+ * GET /api/layouts
+ * Returns all configured room layouts (from MongoDB or defaults).
+ */
+app.get('/api/layouts', async (_req, res) => {
+  try {
+    const db = getDBStatus();
+    if (db.connected) {
+      const layouts = await OfficeLayout.find({}).lean();
+      if (layouts.length > 0) {
+        return res.json({ success: true, count: layouts.length, layouts, source: 'mongodb' });
+      }
+    }
+    return res.json({
+      success: true,
+      count: Object.keys(DEFAULT_LAYOUTS).length,
+      layouts: Object.values(DEFAULT_LAYOUTS),
+      source: 'defaults',
+    });
+  } catch (err) {
+    log('error', `[API] /api/layouts error: ${err.message}`);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/layouts/:roomId
+ * Returns a specific room's layout (obstacles, workstations, dimensions).
+ */
+app.get('/api/layouts/:roomId', async (req, res) => {
+  const roomId = req.params.roomId.trim().toLowerCase();
+  try {
+    const db = getDBStatus();
+    if (db.connected) {
+      const layout = await OfficeLayout.findOne({ roomId }).lean();
+      if (layout) {
+        return res.json({ success: true, layout, source: 'mongodb' });
+      }
+    }
+    if (DEFAULT_LAYOUTS[roomId]) {
+      return res.json({ success: true, layout: DEFAULT_LAYOUTS[roomId], source: 'defaults' });
+    }
+    return res.status(404).json({ success: false, error: `Layout not found for room '${roomId}'` });
+  } catch (err) {
+    log('error', `[API] /api/layouts/:roomId error: ${err.message}`);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+/**
+ * PUT /api/layouts/:roomId
+ * Updates or persists a specific room layout in MongoDB.
+ */
+app.put('/api/layouts/:roomId', async (req, res) => {
+  const roomId = req.params.roomId.trim().toLowerCase();
+  const { name, dimensions, obstacles, workstations } = req.body;
+
+  if (!name || typeof name !== 'string') {
+    return res.status(400).json({ success: false, error: 'Layout name is required' });
+  }
+
+  try {
+    const db = getDBStatus();
+    if (!db.connected) {
+      return res.status(503).json({ success: false, error: 'Database unavailable for persistent updates' });
+    }
+
+    const updated = await OfficeLayout.findOneAndUpdate(
+      { roomId },
+      {
+        roomId,
+        name,
+        dimensions: dimensions || { width: 800, height: 500 },
+        obstacles: Array.isArray(obstacles) ? obstacles : [],
+        workstations: Array.isArray(workstations) ? workstations : [],
+      },
+      { upsert: true, new: true, runValidators: true }
+    ).lean();
+
+    return res.json({ success: true, layout: updated });
+  } catch (err) {
+    log('error', `[API] PUT /api/layouts/:roomId error: ${err.message}`);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
 });
 
 /**
@@ -273,6 +434,70 @@ app.get('/api/users/nearby', async (req, res) => {
     return res.json({ success: true, nearby, source: 'memory' });
   } catch (err) {
     log('error', `[API] /api/users/nearby error: ${err.message}`);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/users/near?x=400&y=250&maxDistance=100
+ * Returns users ordered nearest-to-farthest using MongoDB 2dsphere $near query.
+ * Includes queryLatencyMs for high-performance geospatial audit.
+ */
+app.get('/api/users/near', async (req, res) => {
+  const x = parseFloat(req.query.x);
+  const y = parseFloat(req.query.y);
+  const maxDist = parseFloat(req.query.maxDistance) || EARSHOT_PIXELS;
+
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return res.status(400).json({ success: false, error: 'x and y query params are required' });
+  }
+
+  const startHr = process.hrtime.bigint();
+  try {
+    const db = getDBStatus();
+    if (db.connected) {
+      const nearQuery = buildNearQuery(x, y, maxDist);
+      const sessions = await Session.find(nearQuery)
+        .select('socketId name email room x y avatarColor avatarStyle status -_id')
+        .limit(50)
+        .lean();
+
+      const elapsedNs = process.hrtime.bigint() - startHr;
+      const queryLatencyMs = Number(elapsedNs) / 1e6;
+
+      return res.json({
+        success: true,
+        count: sessions.length,
+        users: sessions,
+        source: 'mongodb-2dsphere-near',
+        queryLatencyMs: Number(queryLatencyMs.toFixed(3)),
+      });
+    }
+
+    // In-memory fallback sorted nearest-first
+    const nearby = [];
+    for (const [, user] of users) {
+      const dx = user.x - x;
+      const dy = user.y - y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist <= maxDist) {
+        nearby.push({ ...user, distance: Number(dist.toFixed(1)) });
+      }
+    }
+    nearby.sort((a, b) => a.distance - b.distance);
+
+    const elapsedNs = process.hrtime.bigint() - startHr;
+    const queryLatencyMs = Number(elapsedNs) / 1e6;
+
+    return res.json({
+      success: true,
+      count: nearby.length,
+      users: nearby,
+      source: 'memory-sorted',
+      queryLatencyMs: Number(queryLatencyMs.toFixed(3)),
+    });
+  } catch (err) {
+    log('error', `[API] /api/users/near error: ${err.message}`);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
@@ -518,15 +743,6 @@ io.on('connection', async (socket) => {
             }
           ).catch((err) => log('warn', `[DB] Session update failed: ${err.message}`));
         }
-      }
-        io.to(roomToJoin).emit('user-profile-updated', {
-          id: socket.id,
-          name: user.name,
-          avatarColor: user.avatarColor,
-          avatarStyle: user.avatarStyle,
-          status: user.status,
-        });
-        io.emit('presence-list', getOfficePresence());
       }
       const currentRoomUsers = Array.from(users.values()).filter((u) => u.room === roomToJoin);
       socket.emit('initial-users', currentRoomUsers);
@@ -1098,8 +1314,15 @@ async function start() {
     log('log', `Earshot radius:  ${EARSHOT_PIXELS} canvas pixels`);
   });
 
-  // Connect to MongoDB non-blockingly; server is already live and responsive
-  connectDB(MONGODB_URI);
+  // Setup Redis Pub/Sub adapter if configured (fallback to in-memory)
+  await setupRedisAdapter(io);
+
+  // Connect to MongoDB non-blockingly; seed defaults if connected
+  connectDB(MONGODB_URI).then((connected) => {
+    if (connected) {
+      seedDefaultLayouts();
+    }
+  });
 }
 
 // ── Graceful shutdown ────────────────────────────────────────────────────────

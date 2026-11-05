@@ -17,8 +17,11 @@
 - 💎 **Premium SaaS Design** — Crisp white and soft off-white surfaces, blue & cyan accents, refined cards, restrained glassmorphism, accessible inline SVG icon library, and reduced-motion support
 - 👥 **Real-Time Presence** — Live avatars powered by Socket.IO; room-scoped join/leave events and movements
 - 🏃 **Avatar Movement** — WASD / arrow keys and on-screen compass direction pad; server-authoritative position clamping
-- 📍 **Geospatial Proximity Engine** — MongoDB with `2dsphere` index; earshot radius filtering strictly within the same room
-- 🔊 **Spatial Voice Chat** — WebRTC peer connections with Web Audio API `GainNode` for smooth distance-based volume; automatic audio teardown on room switch
+- 📍 **Geospatial Proximity Engine** — MongoDB with `2dsphere` index; earshot radius filtering strictly within the same room; supports both `$geoWithin` boundary scans and `$near` distance-sorted lookups (`GET /api/users/near`)
+- 🔊 **Stereo Spatial Audio & Raycast Obstacles** — Web Audio API `StereoPannerNode` for dynamic left/right ear panning (-1.0 to +1.0) and AABB raycast sound obstruction across glass walls, acoustic booths, and desks with material attenuation
+- ⚡ **60 FPS Performance Engine** — Unobtrusive canvas frame-rate diagnostics probe tracking render ticks and frame latency in real time
+- 🔄 **Horizontal Scaling & Redis Pub/Sub** — Multi-instance clustering support via `@socket.io/redis-adapter` and `ioredis` with automatic graceful fallback to in-memory mode
+- 💾 **Persistent Office Layouts** — MongoDB `OfficeLayout` schema and REST endpoints (`GET /api/layouts`, `GET /api/layouts/:roomId`, `PUT /api/layouts/:roomId`) for room layouts, obstacle sound absorption, and workstations
 - 🎤 **Microphone Controls** — Request, mute/unmute, and hardware-releasing turn-off controls with permission status
 - 📱 **Responsive UI** — Accessible desktop, tablet, and mobile layouts with zero horizontal overflow
 
@@ -412,6 +415,23 @@ Branch naming convention: `feature/`, `fix/`, `docs/`, `test/`
 | `TURN_USERNAME` | *(empty)* | Optional TURN username |
 | `TURN_CREDENTIAL` | *(empty)* | Optional TURN credential |
 | `MOVE_RATE_LIMIT` | `20` | Max move events per second per user |
+| `REDIS_URL` | *(empty)* | Optional Redis pub/sub URL for multi-instance clustering (e.g. `redis://:pwd@127.0.0.1:6379`) |
+| `REDIS_HOST` | *(empty)* | Optional Redis hostname |
+| `REDIS_PORT` | `6379` | Optional Redis port |
+| `REDIS_PASSWORD` | *(empty)* | Optional Redis password |
+
+### REST API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/health` | Service health, DB state, Redis adapter state, active user counts |
+| `GET` | `/api/presence` | Real-time directory of all connected office participants |
+| `GET` | `/api/ice-servers` | Dynamic WebRTC STUN/TURN configuration |
+| `GET` | `/api/users/nearby?x=400&y=250` | `$geoWithin` spherical boundary query for nearby users |
+| `GET` | `/api/users/near?x=400&y=250&maxDistance=100` | 2dsphere `$near` geospatial lookup sorted nearest-first with query latency timing |
+| `GET` | `/api/layouts` | Returns all office room layouts and acoustic obstacle profiles |
+| `GET` | `/api/layouts/:roomId` | Returns floor plan, obstacles, and workstations for a specific room |
+| `PUT` | `/api/layouts/:roomId` | Persists customized furniture, wall boundaries, and sound absorption factors |
 
 ### Frontend (`frontend/.env`)
 

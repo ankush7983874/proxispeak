@@ -1221,6 +1221,12 @@ body {
   border: 1px solid var(--primary-ring);
 }
 
+.nearby-vol.obstructed {
+  color: #854d0e;
+  background: #fefce8;
+  border-color: #fef08a;
+}
+
 .user-mic-pill {
   font-size: 11px;
   display: inline-flex;
@@ -3776,6 +3782,12 @@ body {
   background: #eff6ff;
   color: var(--primary-blue);
   border: 1px solid #bfdbfe;
+}
+
+.presence-audio-pill.near.obstructed {
+  background: #fefce8;
+  color: #854d0e;
+  border: 1px solid #fef08a;
 }
 
 .presence-audio-pill.far {

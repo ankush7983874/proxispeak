@@ -24,7 +24,7 @@ import {
   CrownIcon,
   DiamondIcon,
 } from './Icons.jsx';
-import { volumeFromDistance } from '../utils/proximity.js';
+import { volumeFromDistance, calculateAudioObstruction } from '../utils/proximity.js';
 
 export function PresencePanel({
   presenceList = [],
@@ -32,6 +32,8 @@ export function PresencePanel({
   currentRoom = 'general',
   nearbyUsers = [],
   onJoinRoom = null,
+  me = null,
+  obstacles = [],
 }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('all'); // 'all' | 'online' | 'busy' | 'away'
@@ -239,11 +241,26 @@ export function PresencePanel({
 
                     {/* Same-Room Proximity Volume Info */}
                     {isInSameRoom && !isMe && (
-                      nearbyInfo ? (
-                        <span className="presence-audio-pill near" title="Within earshot radius">
-                          🔊 {Math.round(volumeFromDistance(nearbyInfo.dist) * 100)}%
-                        </span>
-                      ) : (
+                      nearbyInfo ? (() => {
+                        let transmission = 1.0;
+                        let blockedBy = [];
+                        if (me && obstacles && obstacles.length > 0) {
+                          const obs = calculateAudioObstruction(me, p, obstacles);
+                          transmission = obs.transmission;
+                          blockedBy = obs.blockedBy;
+                        }
+                        const finalPct = Math.round(volumeFromDistance(nearbyInfo.dist) * transmission * 100);
+                        const isObstructed = blockedBy.length > 0;
+
+                        return (
+                          <span
+                            className={`presence-audio-pill near ${isObstructed ? 'obstructed' : ''}`}
+                            title={isObstructed ? `Proximity volume: ${finalPct}% (obstructed by ${blockedBy.join(', ')})` : `Proximity volume: ${finalPct}%`}
+                          >
+                            🔊 {finalPct}%{isObstructed ? ' 🧱' : ''}
+                          </span>
+                        );
+                      })() : (
                         <span className="presence-audio-pill far" title="Beyond earshot radius">
                           Far
                         </span>
